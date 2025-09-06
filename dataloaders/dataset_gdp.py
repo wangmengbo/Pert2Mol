@@ -5,170 +5,153 @@ import json
 import torch
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+import scanpy as sc
+import anndata as ad
+from typing import Dict, List, Optional, Tuple
 from rdkit import Chem
-from dataloaders.dataloader import DatasetWithDrugs, image_transform
+from sklearn.model_selection import train_test_split
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from .dataloader import (
+	DatasetWithDrugs, image_transform, create_raw_drug_dataloader, 
+	create_leak_free_dataloaders
+)
+from .utils import validate_dosage_integration
 
 logger = logging.getLogger(__name__)
 
-def convert_to_aromatic_smiles(smiles):
-    """Convert SMILES to aromatic notation with lowercase aromatic atoms."""
-    if not smiles:
-        return smiles
-    
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            # Generate aromatic SMILES (kekuleSmiles=False is the default)
-            aromatic_smiles = Chem.MolToSmiles(mol, kekuleSmiles=False)
-            return aromatic_smiles
-        else:
-            return smiles
-    except:
-        return smiles
 
-class RawDrugDataset(DatasetWithDrugs):
-    """Dataset that handles raw PubChem CSV drug data and biological conditioning"""
-    
-    def __init__(self,
-                metadata_control: pd.DataFrame,
-                metadata_drug: pd.DataFrame,
-                drug_data_path: str = None,
-                raw_drug_csv_path: str = None,
-                gene_count_matrix: pd.DataFrame = None,
-                image_json_dict: Dict[str, List[str]] = None,
-                transform=None,
-                target_size=256,
-                debug_mode=False,
-                compound_name_label='compound',
-                smiles_cache: Optional[Dict] = None,
-                smiles_only: bool = False,  # Add this parameter
-                **kwargs):
-        
-        # Load raw drug CSV data
-        self.compound_name_label = compound_name_label
-        self.raw_drug_df = pd.read_csv(raw_drug_csv_path)
-        logger.info(f"Loaded {len(self.raw_drug_df)} raw drug entries from {raw_drug_csv_path}")
-        
-        # Create drug name to SMILES mapping
-        self.drug_name_to_smiles = {}
-        for _, row in self.raw_drug_df.iterrows():
-            if pd.notna(row['canonical_smiles']) and pd.notna(row[self.compound_name_label]):
-                self.drug_name_to_smiles[row[self.compound_name_label]] = convert_to_aromatic_smiles(row['canonical_smiles'])
-        
-        logger.info(f"Created SMILES mapping for {len(self.drug_name_to_smiles)} drugs")
-        sample_drugs = list(self.drug_name_to_smiles.keys())[:3]
-        print("SMILES Conversion Verification:")
-        for drug_name in sample_drugs:
-            converted_smiles = self.drug_name_to_smiles[drug_name]
-            # Find original from CSV
-            original_row = self.raw_drug_df[self.raw_drug_df[self.compound_name_label] == drug_name].iloc[0]
-            original_smiles = original_row['canonical_smiles']
-            
-            print(f"Drug: {drug_name}")
-            print(f"  Original: {original_smiles}")
-            print(f"  Converted: {converted_smiles}")
-            print(f"  Has lowercase: {'c' in converted_smiles or 'n' in converted_smiles or 'o' in converted_smiles}")
-            print()
+# Create combinations within each split
+def create_modality_combinations(rna_df, imaging_df, shared_cell_lines, suffix="train", compound_name_label='compound'):
+    """Create paired combinations within a split"""
+    # logger.info(f"rna_df shape: {rna_df.shape}, imaging_df shape: {imaging_df.shape}")
+    # logger.info(f"rna_df columns: {rna_df.columns.tolist()}")
+    combinations = []
 
-        if smiles_cache is None:
-            self.smiles_cache = {}
-        else:
-            # If a cache is passed (e.g., from main process), use it but it won't be shared across workers
-            self.smiles_cache = smiles_cache
-            
-        # Initialize parent with fallback SMILES dictionary
-        super().__init__(
-            metadata_control=metadata_control,
-            metadata_drug=metadata_drug,
-            gene_count_matrix=gene_count_matrix,
-            image_json_dict=image_json_dict,
-            drug_data_path=drug_data_path,
-            fallback_smiles_dict=self.drug_name_to_smiles,
-            enable_smiles_fallback=False,
-            transform=transform,
-            target_size=target_size,
-            debug_mode=debug_mode,
-            smiles_cache=smiles_cache,
-            smiles_only=smiles_only,  # Pass this to parent
-            **kwargs
-        )
-    
-    def get_target_drug_info(self, idx):
-        """Get target drug information for conditional generation"""
-        treatment_sample = self.filtered_drug_metadata.iloc[idx]
-        compound_name = treatment_sample['compound']
+    def create_combined_row(rna_row, imaging_row, compound_name_label='compound'):
+        """Create a combined row with proper suffixes"""
+        combined_row = {}
         
-        drug_info = {
-            'compound_name': compound_name,
-            'smiles': self.drug_name_to_smiles.get(compound_name, ''),
-        }
+        # Add RNA data with :rna suffix
+        for col in rna_row.index:
+            combined_row[f"{col}:rna"] = rna_row[col]
         
-        # Add additional drug properties if available in raw CSV
-        if compound_name in self.drug_name_to_smiles:
-            drug_row = self.raw_drug_df[
-                self.raw_drug_df[self.compound_name_label] == compound_name
-            ]
-            if not drug_row.empty:
-                row = drug_row.iloc[0]
-                drug_info.update({
-                    'molecular_weight': row.get('molecular_weight', 0),
-                    'xlogp': row.get('xlogp', 0),
-                    'tpsa': row.get('tpsa', 0),
-                })
+        # Add imaging data with :hist suffix
+        for col in imaging_row.index:
+            combined_row[f"{col}:hist"] = imaging_row[col]
         
-        return drug_info
-    
-    def __getitem__(self, idx):
-        # Get base sample with biological data
-        sample = super().__getitem__(idx)
+        # Add shared condition columns without suffix (for dataloader compatibility)
+        combined_row[compound_name_label] = rna_row[compound_name_label]
+        combined_row['cell_line'] = rna_row['cell_line']
+        combined_row['compound_concentration_in_uM'] = rna_row['compound_concentration_in_uM']
+        combined_row['timepoint'] = rna_row['timepoint']
         
-        # Add target drug information for conditional training
-        target_drug_info = self.get_target_drug_info(idx)
-        sample.update({
-            'target_drug_info': target_drug_info,
-            'target_smiles': target_drug_info['smiles']
-        })
-        
-        return sample
+        return combined_row
 
-    def _init_smiles_processor(self):
-        """Initialize components for on-demand SMILES processing."""
-        try:
-            self.rdkit_available = True
-            
-            # Store processing parameters from drug_data for consistency
-            if self.drug_data is not None:
-                self.fingerprint_size = self.drug_data.get('preprocessing_params', {}).get('fingerprint_size', 1024)
-                self.normalize_descriptors = self.drug_data.get('preprocessing_params', {}).get('normalize_descriptors', True)
-            else:
-                self.fingerprint_size = 1024
-                self.normalize_descriptors = True
-            
-            if  self.drug_data is not None and ('modality_dims' in self.drug_data and self.drug_data['drug_embeddings']):
-                sample_drug = next(iter(self.drug_data['drug_embeddings'].values()))
-                if 'descriptors_2d' in sample_drug and hasattr(self, 'normalization_params'):
-                    self.desc_mean = self.normalization_params.get('mean')
-                    self.desc_std = self.normalization_params.get('std')
-            else:
-                # No normalization parameters available - will be computed on-demand
-                self.desc_mean = None
-                self.desc_std = None
+    # Handle A549 separately (as in your original logic)
+    if 'A549' in shared_cell_lines:
+        # For A549, match on compound, cell_line, timepoint only (not concentration)
+        a549_rna = rna_df[rna_df['cell_line'] == 'A549']
+        a549_imaging = imaging_df[imaging_df['cell_line'] == 'A549']
+        # logger.info(f"A549 RNA samples: {len(a549_rna)}, Imaging samples: {len(a549_imaging)}")
+        
+        if not a549_rna.empty and not a549_imaging.empty:
+            for _, rna_row in a549_rna.iterrows():
+                matching_imaging = a549_imaging[
+                    (a549_imaging[compound_name_label] == rna_row[compound_name_label]) &
+                    (a549_imaging['timepoint'] == rna_row['timepoint'])
+                ]
                 
-        except ImportError:
-            logger.warning("RDKit not available - SMILES fallback disabled")
-            self.rdkit_available = False
+                for _, imaging_row in matching_imaging.iterrows():
+                    combination = create_combined_row(rna_row, imaging_row)
+                    combinations.append(combination)
+        else:
+            logger.warning("No A549 samples found in either RNA or imaging data for this split")
+    # logger.info(f"A549 combinations created: {len(combinations)}")
+
+    # For other cell lines, use exact matching (including concentration)
+    other_cell_lines = [cl for cl in shared_cell_lines if cl != 'A549']
+    other_rna = rna_df[rna_df['cell_line'].isin(other_cell_lines)]
+    other_imaging = imaging_df[imaging_df['cell_line'].isin(other_cell_lines)]
+    
+    if not other_rna.empty and not other_imaging.empty:
+        # Group by exact matching conditions
+        rna_grouped = other_rna.groupby([
+            compound_name_label, 'cell_line', 'compound_concentration_in_uM', 'timepoint'
+        ])
+        
+        for condition, rna_group in rna_grouped:
+            compound, cell_line, conc, time = condition
+            
+            # Find exactly matching imaging samples
+            matching_imaging = other_imaging[
+                (other_imaging[compound_name_label] == compound) &
+                (other_imaging['cell_line'] == cell_line) &
+                (other_imaging['compound_concentration_in_uM'] == conc) &
+                (other_imaging['timepoint'] == time)
+            ]
+            
+            if not matching_imaging.empty:
+                # Create all combinations for this condition
+                for _, rna_row in rna_group.iterrows():
+                    for _, imaging_row in matching_imaging.iterrows():
+                        combination = create_combined_row(rna_row, imaging_row)
+                        combinations.append(combination)
+    # logger.info(f"Total combinations created (including A549): {len(combinations)}")
+
+    if combinations:
+        combined_df = pd.DataFrame(combinations)
+        logger.info(f"Created {len(combined_df)} {suffix} combinations")
+        logger.info(f"combined_df.head():\n{combined_df.head()}")
+        return combined_df
+    else:
+        logger.warning(f"No {suffix} combinations could be created")
+        return pd.DataFrame()
 
 
-def create_raw_drug_dataloader(
-    metadata_control: pd.DataFrame,
-    metadata_drug: pd.DataFrame,
-    drug_data_path: str,
-    raw_drug_csv_path: str,
+def prepare_metadata_for_dataset(combined_df, compound_name_label='compound'):
+    """Convert combined metadata to format expected by RawDrugDataset"""
+    if combined_df.empty:
+        return pd.DataFrame()
+    
+    metadata_drug = pd.DataFrame()
+    
+    # Essential columns for the dataset
+    essential_cols = [
+        compound_name_label, 'cell_line', 'compound_concentration_in_uM', 'timepoint'
+    ]
+    
+    for col in essential_cols:
+        if col in combined_df.columns:
+            metadata_drug[col] = combined_df[col]
+    
+    # Use RNA sample IDs for transcriptomics data
+    if 'sample_id:rna' in combined_df.columns:
+        metadata_drug['sample_id'] = combined_df['sample_id:rna'].astype(str)
+    
+    # Use imaging json_key for image loading
+    if 'json_key:hist' in combined_df.columns:
+        metadata_drug['json_key'] = combined_df['json_key:hist'].astype(str)
+    
+    # Ensure data types match expectations
+    for col in ['timepoint', 'compound_concentration_in_uM']:
+        if col in metadata_drug.columns:
+            metadata_drug[col] = pd.to_numeric(metadata_drug[col], errors='coerce')
+    
+    for col in [compound_name_label, 'cell_line', 'sample_id', 'json_key']:
+        if col in metadata_drug.columns:
+            metadata_drug[col] = metadata_drug[col].astype(str)
+    
+    return metadata_drug
+
+
+def create_gdp_dataloaders(metadata_control: pd.DataFrame=None,
+    metadata_drug: pd.DataFrame=None,
+    drug_data_path: str=None,
+    raw_drug_csv_path: str=None,
     image_json_path: str = None,
     gene_count_matrix: pd.DataFrame = None,
     compound_name_label='compound',
-    batch_size: int = 2,
+    batch_size: int = 4,
     shuffle: bool = True,
     num_workers: int = 0,
     transform=None,
@@ -182,128 +165,109 @@ def create_raw_drug_dataloader(
     debug_cell_lines: Optional[List[str]] = None,
     debug_drugs: Optional[List[str]] = None,
     smiles_cache: Optional[Dict] = None,
+    split_train_test: bool = False,
+    test_size: float = 0.2,
+    return_datasets: bool = False,  # Add this parameter
     **kwargs
-):
-    """Create DataLoader for raw drug CSV data with biological conditioning"""
+    ):
+    # Your file paths
+    IMAGE_JSON_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json"
+    DRUG_DATA_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl"
+    RAW_DRUG_CSV_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv"
+    METADATA_CONTROL_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv"
+    GENE_COUNT_MATRIX_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet"
+
+    # Load your original metadata
+    gdpx1x2_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/processed_data/GDPx1x2_metadata.csv")
+    gdpx3_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/GDPx3/metadata_updated.csv")
+    if gene_count_matrix is None:
+        gene_count_matrix = pd.read_parquet(GENE_COUNT_MATRIX_PATH)
     
-    # Load image paths
-    if image_json_path is not None:
-        with open(image_json_path, 'r') as f:
-            image_json_dict = json.load(f)
-    else:
-        image_json_dict = {}
-        logger.info("No image JSON path provided or file does not exist - proceeding without images")
+    # Find shared conditions
+    shared_drugs = list(set(gdpx3_metadata['compound'].unique()).intersection(
+        gdpx1x2_metadata['compound'].unique()
+    ))
+    shared_drugs = [drug for drug in shared_drugs if drug != 'DMSO']
+    logger.info(f"Found {len(shared_drugs)} shared drugs (excluding DMSO)")
 
-    logger.info(f"drug_data_path={drug_data_path}")
+    shared_cell_lines = list(set(gdpx3_metadata['cell_line'].unique()).intersection(
+        gdpx1x2_metadata['cell_line'].unique()
+    ))
+    logger.info(f"Found {len(shared_cell_lines)} shared cell lines: {shared_cell_lines}")
+    
+    # Create your control metadata (keep this as is - it's fine to share controls)
+    metadata_control = []
+    
+    # A549 control (special handling for dosage mismatch)
+    metadata_control.append(pd.merge(
+        gdpx3_metadata[(gdpx3_metadata['compound'] == 'DMSO') & (gdpx3_metadata['cell_line'] == 'A549')],
+        gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') & (gdpx1x2_metadata['cell_line'] == 'A549')],
+        left_on=['compound', 'cell_line', 'compound_concentration_in_uM', 'timepoint'],
+        right_on=['compound', 'cell_line', 'compound_concentration_in_uM', 'timepoint'],
+        suffixes=(':hist', ':rna'),
+    ))
+    
+    # Other cell lines control (exact matching)
+    metadata_control.append(pd.merge(
+        gdpx3_metadata[(gdpx3_metadata['compound'] == 'DMSO') & (gdpx3_metadata['cell_line'] != 'A549')],
+        gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') & (gdpx1x2_metadata['cell_line'] != 'A549')],
+        left_on=['compound', 'cell_line', 'timepoint'],
+        right_on=['compound', 'cell_line', 'timepoint'],
+        suffixes=(':hist', ':rna'),
+    ))
+    
+    metadata_control = pd.concat(metadata_control, ignore_index=True).drop_duplicates()
+    
+    # Fix data types
+    for col in metadata_control.columns:
+        if col.endswith('id'):
+            metadata_control[col] = metadata_control[col].astype(str)
 
-    # Create dataset
-    dataset = RawDrugDataset(
+    # Create leak-free train/test dataloaders
+    train_loader, test_loader = create_leak_free_dataloaders(
         metadata_control=metadata_control,
-        metadata_drug=metadata_drug,
+        metadata_rna=gdpx1x2_metadata[gdpx1x2_metadata['compound'] != 'DMSO'],
+        metadata_imaging=gdpx3_metadata[gdpx3_metadata['compound'] != 'DMSO'],
+        shared_drugs=shared_drugs,
+        shared_cell_lines=shared_cell_lines,
         gene_count_matrix=gene_count_matrix,
-        image_json_dict=image_json_dict,
-        drug_data_path=drug_data_path,
-        raw_drug_csv_path=raw_drug_csv_path,
-        compound_name_label=compound_name_label,
-        transform=transform or image_transform,
-        target_size=target_size,
-        smiles_cache=smiles_cache,
+        image_json_path=IMAGE_JSON_PATH,
+        drug_data_path=DRUG_DATA_PATH,
+        raw_drug_csv_path=RAW_DRUG_CSV_PATH,
+        # test_size=test_size,
+        final_train_test_ratio = (1-test_size)/test_size,
+        batch_size=batch_size,
+        shuffle=True,
+        stratify_by=['cell_line', 'compound'],
+        use_highly_variable_genes=True,
+        n_top_genes=n_top_genes,
+        prepare_metadata_for_dataset=prepare_metadata_for_dataset,
+        create_modality_combinations=create_modality_combinations,
         debug_mode=debug_mode,
         debug_samples=debug_samples,
         debug_cell_lines=debug_cell_lines,
-        debug_drugs=debug_drugs,
-        smiles_only=True,
-        **kwargs
+        debug_drugs=debug_drugs
     )
     
-    # Apply highly variable gene selection
-    if use_highly_variable_genes:
-        # Same HVG processing as in original dataloader
-        import scanpy as sc
-        import anndata as ad
-        
-        adata = ad.AnnData(
-            X=dataset.gene_count_matrix.T.values,
-            obs=dataset.gene_count_matrix.T.index.to_frame(),
-            var=dataset.gene_count_matrix.T.columns.to_frame()
-        )
-        adata.layers['counts'] = adata.X.copy()
-        sc.pp.normalize_total(adata, target_sum=1e6)
-        sc.pp.log1p(adata)
-        # adata.X = np.nan_to_num(adata.X, nan=0.0, posinf=0.0, neginf=0.0)
-        sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes)
-        hvg_genes = adata.var_names[adata.var['highly_variable']]
-        
-        if zscore:
-            sc.pp.scale(adata)
-        if not normalize:
-            adata.X = adata.layers['counts']
-            
-        dataset.gene_count_matrix = adata[:, hvg_genes].to_df().T
+    logger.info(f"Train samples: {len(train_loader.dataset)}")
+    logger.info(f"Test samples: {len(test_loader.dataset)}")
     
-    # collate function
-    def conditional_collate_fn(batch):
-        collated = {
-            'control_transcriptomics': torch.stack([item['control_transcriptomics'] for item in batch]),
-            'treatment_transcriptomics': torch.stack([item['treatment_transcriptomics'] for item in batch]),
-            'control_images': torch.stack([item['control_images'] for item in batch]),
-            'treatment_images': torch.stack([item['treatment_images'] for item in batch]),
-            'compound_name': [item['compound_name'] for item in batch],
-            'conditioning_info': [item['conditioning_info'] for item in batch],
-            'target_smiles': [item['target_smiles'] for item in batch],
-            'target_drug_info': [item['target_drug_info'] for item in batch]
-        }
-        
-        # Handle drug conditions (same as original)
-        drug_conditions = []
-        for item in batch:
-            drug_cond = item['drug_condition']
-            if drug_cond.numel() == 0:
-                drug_cond = torch.zeros(1047, dtype=torch.float32)
-            drug_conditions.append(drug_cond)
-        
-        if len(set(dc.shape for dc in drug_conditions)) == 1:
-            collated['drug_condition'] = torch.stack(drug_conditions)
-        else:
-            max_len = max(dc.shape[0] for dc in drug_conditions)
-            padded_conditions = []
-            for dc in drug_conditions:
-                if dc.shape[0] < max_len:
-                    padded = torch.zeros(max_len, dtype=torch.float32)
-                    padded[:dc.shape[0]] = dc
-                    padded_conditions.append(padded)
-                else:
-                    padded_conditions.append(dc)
-            collated['drug_condition'] = torch.stack(padded_conditions)
-        
-        return collated
-    
-    # Adjust for debug mode
-    if debug_mode:
-        batch_size = min(batch_size, 4)
-        num_workers = 0
-        shuffle = False
-    
-    return torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=conditional_collate_fn,
-        pin_memory=torch.cuda.is_available()
-    )
+    if return_datasets:
+        return train_loader.dataset, test_loader.dataset
+    else:
+        return train_loader, test_loader
 
-# if __name__ == '__main__':
-#     dataloader = create_raw_drug_dataloader(
-#         metadata_control=metadata_control,
-#         metadata_drug=metadata_drug,
-#         gene_count_matrix=gene_expression,
-#         image_json_path=args.image_json_path,
-#         drug_data_path=args.drug_data_path,
-#         raw_drug_csv_path=args.raw_drug_csv_path,
-#         batch_size=args.batch_size,
-#         debug_mode=args.debug_mode,
-#         debug_samples=50 if args.debug_mode else None,
-#         compound_name_label='original_name',
-#         smiles_cache=smiles_cache,
-#     )
+
+if __name__ == "__main__":
+    train_loader, test_loader = create_gdp_dataloaders()
+    # Test the first batch
+    for batch in train_loader:
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                print(f"{k}: {v.shape}")
+            else:
+                print(f"{k}: {type(v)} - {len(v)} items")
+        break
+
+    validate_dosage_integration(train_loader)
+

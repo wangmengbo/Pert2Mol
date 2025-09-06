@@ -163,6 +163,8 @@ def main(args):
     metadata_control = pd.read_csv(args.metadata_control_path)
     metadata_drug = pd.read_csv(args.metadata_drug_path)
     gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
+    if args.transpose_gene_count_matrix:
+        gene_count_matrix = gene_count_matrix.T
     print(f"Loaded gene matrix: {gene_count_matrix.shape}")
 
     # Create DiT model
@@ -234,11 +236,17 @@ def main(args):
         drug_data_path=args.drug_data_path,
         raw_drug_csv_path=args.raw_drug_csv_path,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
-        compound_name_label='compound',
+        compound_name_label=args.compound_name_label,
+        split_train_test=args.split_train_test,
         debug_mode=args.debug_mode,
+        debug_samples=50,
     )
+
+    if args.split_train_test:
+        loader = loader[1]
+        loader.set_shuffle(True)
 
     print(f"Created dataloader with {len(loader)} batches")
 
@@ -354,7 +362,10 @@ def main(args):
                         'timestamp': time.time()
                     }
                     results.append(result)
-                    
+
+            failed_retrievals = [r for r in results if r['target_smiles'] not in r.get('all_candidates', [])]
+            print(f"Target not in candidates: {len(failed_retrievals)} cases")
+
         elif args.inference_mode == 'generation':
             # Pure generation mode
             all_generated = []
@@ -566,7 +577,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
-    parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/001-LDMol/checkpoints/0050000.pt')
+    parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/001-LDMol_gdp/checkpoints/0050000.pt')
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")
     
     # Data paths
@@ -576,7 +587,9 @@ if __name__ == "__main__":
     parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
     parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
     parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
-    
+    parser.add_argument("--compound-name-label", type=str, default="compound")
+    parser.add_argument("--transpose-gene-count-matrix", action="store_true", default=False)
+
     # Generation parameters
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-samples-per-condition", type=int, default=3)
@@ -584,10 +597,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-batches", type=int, default=50)
     parser.add_argument("--global-seed", type=int, default=42)
     parser.add_argument("--debug-mode", action="store_true")
+    parser.add_argument("--split-train-test", action="store_true")
     
     # Inference mode arguments
     parser.add_argument("--inference-mode", type=str, choices=['retrieval', 'generation', 'adaptive'], 
-                       default='generation', help='Inference mode: retrieval, generation, or adaptive')
+                       default='retrieval', help='Inference mode: retrieval, generation, or adaptive')
     parser.add_argument("--confidence-threshold", type=float, default=0.4,
                        help='Confidence threshold for adaptive mode (0-1)')
     parser.add_argument("--retrieval-top-k", type=int, default=3,

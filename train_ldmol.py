@@ -32,7 +32,9 @@ from utils import AE_SMILES_encoder, regexTokenizer, dual_rna_image_encoder # mo
 import random
 
 from encoders import ImageEncoder, RNAEncoder
-from dataloaders.dataset_gdp import create_raw_drug_dataloader
+from dataloaders.dataloader import create_raw_drug_dataloader
+from dataloaders.dataset_gdp import create_gdp_dataloaders
+from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
 from dataloaders.download import download_model, find_model
 from diffusion.rectified_flow import create_rectified_flow
 
@@ -47,20 +49,17 @@ def update_ema(ema_model, model, decay=0.9999):
     for name, param in model_params.items():
         # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
     """
     for p in model.parameters():
         p.requires_grad = flag
-
 def cleanup():
     """
     End DDP training.
     """
     dist.destroy_process_group()
-
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
@@ -119,8 +118,7 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         x_batch_shape = (batch_size * 2,) + shape[1:]
     else:
         # No guidance
-        return flow.sample(model, shape, num_steps=num_steps, 
-                         model_kwargs={'y': y_full, 'pad_mask': pad_mask})
+        return flow.sample_dopri5(model, shape, num_steps=20,atol=1e-5, rtol=1e-3,model_kwargs=your_conditioning)
     
     # Sample with batched conditioning
     def cfg_model_fn(x, t, **kwargs):
@@ -137,8 +135,7 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
             out_final = out_rna + cfg_scale_rna * (out_cond - out_rna)
         elif cfg_scale_image != 1.0:
             out_cond, out_img = torch.chunk(out, 2, dim=0)
-            out_final = out_img + cfg_scale_image * (out_cond - out_img)
-        
+            out_final = out_img + cfg_scale_image * (out_cond - out_img) 
         return out_final
     
     # Custom sampling with CFG model
@@ -154,13 +151,16 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         x = x + dt * velocity
     
     return x
-    
+
 def main(args):
     """
     Trains a new DiT model with flexible single/multi-GPU support.
     """
+    global create_data_loader, gene_count_matrix, metadata_control, metadata_drug
+    print(f"create_data_loader: {create_data_loader}")
+
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-    
+
     # Check CUDA compatibility
     try:
         device_capability = torch.cuda.get_device_capability()
@@ -255,7 +255,7 @@ def main(args):
     requires_grad(ema, False)
     
     if use_ddp:
-        model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
+        model = DDP(model.to(device), device_ids=[rank])
     else:
         model = model.to(device)
         
@@ -319,19 +319,69 @@ def main(args):
     opt = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=0)
 
     # Setup data
-    loader = create_raw_drug_dataloader(
-        metadata_control=metadata_control,
-        metadata_drug=metadata_drug, 
-        gene_count_matrix=gene_count_matrix,
-        image_json_path=args.image_json_path,
-        drug_data_path=args.drug_data_path,
-        raw_drug_csv_path=args.raw_drug_csv_path,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        compound_name_label=args.compound_name_label,
-        debug_mode=args.debug_mode,
-    )
+    if use_ddp:
+        # For DDP, we need datasets first, then create samplers
+        train_dataset, test_dataset = create_data_loader(
+            metadata_control=metadata_control,
+            metadata_drug=metadata_drug, 
+            gene_count_matrix=gene_count_matrix,
+            image_json_path=args.image_json_path,
+            drug_data_path=args.drug_data_path,
+            raw_drug_csv_path=args.raw_drug_csv_path,
+            batch_size=batch_size,
+            shuffle=False,  # Don't shuffle here, sampler will handle it
+            num_workers=args.num_workers,
+            compound_name_label=args.compound_name_label,
+            debug_mode=args.debug_mode,
+            split_train_test=True,
+            return_datasets=True,  # New parameter to return datasets instead of loaders
+        )
+        
+        # Create distributed samplers
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True
+        )
+        test_sampler = DistributedSampler(
+            test_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=False
+        )
+        
+        # Create loaders with samplers
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            sampler=test_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+    else:
+        # Single GPU - use existing approach
+        train_loader, test_loader = create_data_loader(
+            metadata_control=metadata_control,
+            metadata_drug=metadata_drug, 
+            gene_count_matrix=gene_count_matrix,
+            image_json_path=args.image_json_path,
+            drug_data_path=args.drug_data_path,
+            raw_drug_csv_path=args.raw_drug_csv_path,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            compound_name_label=args.compound_name_label,
+            debug_mode=args.debug_mode,
+            split_train_test=True,
+        )
 
     # Prepare models for training
     if use_ddp:
@@ -349,8 +399,10 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
+        if use_ddp:
+            train_sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for batch in loader:
+        for batch in train_loader:
             with torch.no_grad():
                 target_smiles = batch['target_smiles']
                 x = AE_SMILES_encoder(target_smiles, ae_model).permute((0, 2, 1)).unsqueeze(-1)
@@ -461,15 +513,16 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=10000)
+    parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--use-distributed", action="store_true", help="Enable distributed training across multiple GPUs")
     
-    parser.add_argument("--image-json-path", type=str, default=None)
-    parser.add_argument("--drug-data-path", type=str, default=None)
-    parser.add_argument("--raw-drug-csv-path", type=str, default=None)
-    parser.add_argument("--metadata-control-path", type=str, default=None)
-    parser.add_argument("--metadata-drug-path", type=str, default=None)
-    parser.add_argument("--gene-count-matrix-path", type=str, default=None)
+    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "other"], default="gdp")
+    parser.add_argument("--image-json-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json")
+    parser.add_argument("--drug-data-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl")
+    parser.add_argument("--raw-drug-csv-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv")
+    parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
+    parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
+    parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
     parser.add_argument("--compound-name-label", type=str, default="compound")
     parser.add_argument("--transpose-gene-count-matrix", action='store_true', default=False)
     parser.add_argument("--debug-mode", action='store_true', default=False)
@@ -477,20 +530,37 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
 
-    for i in ["image_json_path", "gene_count_matrix_path"]:
-        try:
-            if args.__dict__[i] is not None:
-                assert os.path.exists(args.__dict__[i]), f"Cannot find {args.__dict__[i]}."
-        except Exception as e:
-            print(e, f"; Reset {i} to None")
-            args.__dict__[i] = None
-    assert not (args.image_json_path is None and args.gene_count_matrix_path is None), "Warning: Both image_json_path and gene_count_matrix_path are None. At least one must be provided."
-    
-    metadata_control = pd.read_csv(args.metadata_control_path)
-    metadata_drug = pd.read_csv(args.metadata_drug_path)
     gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
 
-    if args.transpose_gene_count_matrix:
+    if args.dataset == "gdp":
+        create_data_loader = create_gdp_dataloaders
+    elif args.dataset == "lincs_rna":
+        create_data_loader = create_lincs_rna_dataloaders
         gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "other":
+        for i in ["image_json_path", "gene_count_matrix_path"]:
+            try:
+                if args.__dict__[i] is not None:
+                    assert os.path.exists(args.__dict__[i]), f"Cannot find {args.__dict__[i]}."
+            except Exception as e:
+                print(e, f"; Reset {i} to None")
+                args.__dict__[i] = None
+        assert not (args.image_json_path is None and args.gene_count_matrix_path is None), "Warning: Both image_json_path and gene_count_matrix_path are None. At least one must be provided."
+
+        if args.transpose_gene_count_matrix:
+            gene_count_matrix = gene_count_matrix.T
+        
+        create_data_loader = create_raw_drug_dataloader
+    else:
+        raise ValueError(f"Unknown dataset {args.dataset}.")
+
+    print(f"create_data_loader: {create_data_loader}")
+
+    metadata_control = metadata_drug = None
+    if args.metadata_control_path is not None:
+        metadata_control = pd.read_csv(args.metadata_control_path)
+    
+    if args.metadata_drug_path is not None:
+        metadata_drug = pd.read_csv(args.metadata_drug_path)
 
     main(args)

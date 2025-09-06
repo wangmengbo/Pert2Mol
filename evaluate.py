@@ -19,6 +19,8 @@ from sklearn.preprocessing import StandardScaler
 import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict, Counter
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+
 
 class ComprehensiveMolecularEvaluator:
     """Comprehensive molecular evaluation with multiple similarity metrics and baselines."""
@@ -183,6 +185,171 @@ class ComprehensiveMolecularEvaluator:
             print(f"Error calculating novelty: {e}")
             return 0.0, 'error'
 
+
+def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0.9]):
+    """Calculate retrieval accuracy, precision, recall, F1 for different similarity thresholds."""
+    
+    retrieval_results = [r for r in results if r.get('method') == 'retrieval' and r.get('is_valid', False)]
+    
+    if not retrieval_results:
+        return {}
+    
+    metrics_by_threshold = {}
+    
+    for threshold in similarity_thresholds:
+        # Classification based on similarity threshold
+        true_positives = 0
+        false_positives = 0 
+        false_negatives = 0
+        true_negatives = 0
+        
+        exact_matches = 0
+        top_k_hits = 0
+        total_samples = len(retrieval_results)
+        
+        for result in retrieval_results:
+            target_smiles = result['target_smiles']
+            generated_smiles = result['generated_smiles']
+            all_candidates = result.get('all_candidates', [])
+            
+            # Calculate similarity between target and generated
+            similarity_score = 0.0
+            if 'similarity_analysis' in result:
+                # Use Morgan fingerprint similarity as main metric
+                similarity_score = result['similarity_analysis'].get('morgan_r2', 0.0)
+            
+            # Exact match check
+            if target_smiles == generated_smiles:
+                exact_matches += 1
+            
+            # Top-k hit check (target in any candidate)
+            target_in_candidates = target_smiles in all_candidates
+            if target_in_candidates:
+                top_k_hits += 1
+            
+            # Get similarity score for this sample
+            if 'similarity_analysis' in result and 'morgan_r2' in result['similarity_analysis']:
+                similarity_score = result['similarity_analysis']['morgan_r2']
+            else:
+                similarity_score = 0.0
+            
+            # Binary classification based on similarity threshold
+            predicted_positive = similarity_score >= threshold
+            
+            # Ground truth: exact molecular match (canonical SMILES)
+            try:
+                target_mol = Chem.MolFromSmiles(target_smiles)
+                generated_mol = Chem.MolFromSmiles(generated_smiles)
+                
+                if target_mol is not None and generated_mol is not None:
+                    target_canonical = Chem.MolToSmiles(target_mol, canonical=True)
+                    generated_canonical = Chem.MolToSmiles(generated_mol, canonical=True)
+                    actual_positive = target_canonical == generated_canonical
+                else:
+                    actual_positive = False
+            except:
+                actual_positive = target_smiles == generated_smiles  # Fallback to string match
+            
+            if predicted_positive and actual_positive:
+                true_positives += 1
+            elif predicted_positive and not actual_positive:
+                false_positives += 1
+            elif not predicted_positive and actual_positive:
+                false_negatives += 1
+            else:
+                true_negatives += 1
+        
+        # Calculate metrics
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        accuracy = (true_positives + true_negatives) / total_samples if total_samples > 0 else 0.0
+        
+        metrics_by_threshold[f'threshold_{threshold}'] = {
+            'threshold': threshold,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1_score,
+            'accuracy': accuracy,
+            'true_positives': true_positives,
+            'false_positives': false_positives,
+            'true_negatives': true_negatives,
+            'false_negatives': false_negatives
+        }
+    
+    # Overall retrieval metrics (threshold-independent)
+    overall_metrics = {
+        'exact_match_accuracy': exact_matches / total_samples if total_samples > 0 else 0.0,
+        'top_k_hit_rate': top_k_hits / total_samples if total_samples > 0 else 0.0,
+        'exact_matches': exact_matches,
+        'top_k_hits': top_k_hits,
+        'total_samples': total_samples
+    }
+    
+    return {
+        'threshold_based_metrics': metrics_by_threshold,
+        'overall_retrieval_metrics': overall_metrics
+    }
+
+
+def calculate_multi_candidate_metrics(results):
+    """Evaluate all candidates, not just the best one."""
+    
+    retrieval_results = [r for r in results if r.get('method') == 'retrieval']
+    
+    if not retrieval_results:
+        return {}
+    
+    multi_candidate_stats = {
+        'target_in_top_1': 0,
+        'target_in_top_3': 0,
+        'target_in_top_5': 0,
+        'avg_target_rank': [],
+        'total_samples': 0
+    }
+    
+    for result in retrieval_results:
+        target_smiles = result['target_smiles']
+        all_candidates = result.get('all_candidates', [])
+        
+        if not all_candidates:
+            continue
+            
+        multi_candidate_stats['total_samples'] += 1
+        
+        # Check if target is in candidates and at what rank
+        target_rank = None
+        for i, candidate in enumerate(all_candidates):
+            if candidate == target_smiles:
+                target_rank = i + 1  # 1-based ranking
+                break
+        
+        if target_rank is not None:
+            multi_candidate_stats['avg_target_rank'].append(target_rank)
+            
+            if target_rank <= 1:
+                multi_candidate_stats['target_in_top_1'] += 1
+            if target_rank <= 3:
+                multi_candidate_stats['target_in_top_3'] += 1
+            if target_rank <= 5:
+                multi_candidate_stats['target_in_top_5'] += 1
+    
+    total_samples = multi_candidate_stats['total_samples']
+    if total_samples > 0:
+        multi_candidate_stats['hit_rate_top_1'] = multi_candidate_stats['target_in_top_1'] / total_samples
+        multi_candidate_stats['hit_rate_top_3'] = multi_candidate_stats['target_in_top_3'] / total_samples  
+        multi_candidate_stats['hit_rate_top_5'] = multi_candidate_stats['target_in_top_5'] / total_samples
+        
+        if multi_candidate_stats['avg_target_rank']:
+            multi_candidate_stats['mean_reciprocal_rank'] = np.mean([1.0/rank for rank in multi_candidate_stats['avg_target_rank']])
+            multi_candidate_stats['avg_target_rank'] = np.mean(multi_candidate_stats['avg_target_rank'])
+        else:
+            multi_candidate_stats['mean_reciprocal_rank'] = 0.0
+            multi_candidate_stats['avg_target_rank'] = float('inf')
+    
+    return multi_candidate_stats
+
+
 def calculate_comprehensive_molecular_properties(smiles):
     """Extended molecular property calculation."""
     try:
@@ -233,6 +400,7 @@ def calculate_comprehensive_molecular_properties(smiles):
         print(f"Failed to process SMILES {smiles}: {e}")
         return None
 
+
 def calculate_drug_likeness_score(props):
     """Calculate comprehensive drug-likeness score."""
     if not props:
@@ -265,6 +433,7 @@ def calculate_drug_likeness_score(props):
     score += max(0, tpsa_score) * 0.05
     
     return score
+
 
 def diversity_analysis(smiles_list):
     """Diversity analysis with multiple metrics."""
@@ -335,6 +504,7 @@ def diversity_analysis(smiles_list):
     
     return results
 
+
 def analyze_mechanism_consistency(compound_name, generated_smiles, target_smiles):
     """Analyze if generated molecule is mechanistically consistent."""
     compound_name_lower = compound_name.lower()
@@ -404,6 +574,7 @@ def analyze_mechanism_consistency(compound_name, generated_smiles, target_smiles
         'generated_features': generated_features,
         'mechanism_consistency_score': consistency_score
     }
+
 
 def create_evaluation_plots(results, output_dir="./plots"):
     """Create comprehensive evaluation plots."""
@@ -482,9 +653,10 @@ def create_evaluation_plots(results, output_dir="./plots"):
         plt.savefig(f"{output_dir}/similarity_analysis.png", dpi=300, bbox_inches='tight')
         plt.close()
 
+
 def main():
     parser = argparse.ArgumentParser(description="Comprehensive evaluation of generated molecules")
-    parser.add_argument("--input-file", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/generated_molecules_generation_42.json",
+    parser.add_argument("--input-file", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/generated_molecules_retrieval_42.json",
                        help="JSON file with generated molecules from inference.py")
     parser.add_argument("--pubchem-fingerprints-path", type=str, default=None,
                        help="Path to pre-computed PubChem fingerprints pickle file")
@@ -584,6 +756,9 @@ def main():
     all_generated_smiles = [r['generated_smiles'] for r in valid_results]
     diversity_metrics = diversity_analysis(all_generated_smiles)
     
+    retrieval_metrics = calculate_retrieval_metrics(valid_results)
+    multi_candidate_metrics = calculate_multi_candidate_metrics(valid_results)
+
     # Calculate comprehensive statistics
     evaluation_time = time.time() - start_time
     
@@ -684,7 +859,9 @@ def main():
         'diversity_metrics': diversity_metrics,
         'property_statistics': property_stats,
         'mechanism_consistency': mechanism_stats,
-        'evaluated_results': valid_results
+        'retrieval_metrics': retrieval_metrics,
+        'multi_candidate_metrics': multi_candidate_metrics,
+        'evaluated_results': valid_results,
     }
     
     # Save comprehensive results
@@ -748,6 +925,33 @@ def main():
         f.write(f"  Property diversity: {diversity_metrics.get('property_diversity', 0):.3f}\n")
         f.write(f"  Unique scaffolds: {diversity_metrics.get('num_unique_scaffolds', 0)}\n\n")
         
+        if retrieval_metrics and 'overall_retrieval_metrics' in retrieval_metrics:
+            f.write("RETRIEVAL PERFORMANCE:\n")
+            overall = retrieval_metrics['overall_retrieval_metrics']
+            f.write(f"  Exact match accuracy: {overall.get('exact_match_accuracy', 0):.3f}\n")
+            f.write(f"  Top-k hit rate: {overall.get('top_k_hit_rate', 0):.3f}\n")
+            f.write(f"  Exact matches: {overall.get('exact_matches', 0)}/{overall.get('total_samples', 0)}\n\n")
+            
+            # Threshold-based metrics
+            if 'threshold_based_metrics' in retrieval_metrics:
+                f.write("SIMILARITY-BASED CLASSIFICATION:\n")
+                for threshold_key, metrics in retrieval_metrics['threshold_based_metrics'].items():
+                    threshold = metrics['threshold']
+                    f.write(f"  Threshold {threshold}:\n")
+                    f.write(f"    Precision: {metrics['precision']:.3f}\n")
+                    f.write(f"    Recall: {metrics['recall']:.3f}\n")
+                    f.write(f"    F1-score: {metrics['f1_score']:.3f}\n")
+                    f.write(f"    Accuracy: {metrics['accuracy']:.3f}\n")
+                f.write("\n")
+        
+        if multi_candidate_metrics and multi_candidate_metrics.get('total_samples', 0) > 0:
+            f.write("MULTI-CANDIDATE ANALYSIS:\n")
+            f.write(f"  Hit rate @ top-1: {multi_candidate_metrics.get('hit_rate_top_1', 0):.3f}\n")
+            f.write(f"  Hit rate @ top-3: {multi_candidate_metrics.get('hit_rate_top_3', 0):.3f}\n")
+            f.write(f"  Hit rate @ top-5: {multi_candidate_metrics.get('hit_rate_top_5', 0):.3f}\n")
+            f.write(f"  Mean reciprocal rank: {multi_candidate_metrics.get('mean_reciprocal_rank', 0):.3f}\n")
+            f.write(f"  Average target rank: {multi_candidate_metrics.get('avg_target_rank', float('inf')):.1f}\n\n")
+
         if mechanism_stats:
             f.write("MECHANISM CONSISTENCY:\n")
             f.write(f"  Mean consistency: {mechanism_stats['mean']:.3f} ± {mechanism_stats['std']:.3f}\n\n")
@@ -778,6 +982,22 @@ def main():
         print(f"  Average novelty ({novelty_method}): {novelty_stats['mean']:.3f}")
         print(f"  Average drug-likeness: {druglikeness_stats.get('mean', 0):.3f}")
         print(f"  Internal diversity: {diversity_metrics.get('internal_diversity', 0):.3f}")
+
+    if retrieval_metrics and 'overall_retrieval_metrics' in retrieval_metrics:
+        overall = retrieval_metrics['overall_retrieval_metrics']
+        print(f"  Exact match accuracy: {overall.get('exact_match_accuracy', 0):.3f}")
+        print(f"  Top-k hit rate: {overall.get('top_k_hit_rate', 0):.3f}")
+        
+        # Show best F1 score across thresholds
+        if 'threshold_based_metrics' in retrieval_metrics:
+            best_f1 = 0
+            best_threshold = 0
+            for metrics in retrieval_metrics['threshold_based_metrics'].values():
+                if metrics['f1_score'] > best_f1:
+                    best_f1 = metrics['f1_score']
+                    best_threshold = metrics['threshold']
+            print(f"  Best F1-score: {best_f1:.3f} (threshold: {best_threshold})")
+
 
 if __name__ == "__main__":
     main()
