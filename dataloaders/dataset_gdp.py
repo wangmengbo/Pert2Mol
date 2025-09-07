@@ -143,7 +143,6 @@ def prepare_metadata_for_dataset(combined_df, compound_name_label='compound'):
     
     return metadata_drug
 
-
 def create_gdp_dataloaders(metadata_control: pd.DataFrame=None,
     metadata_drug: pd.DataFrame=None,
     drug_data_path: str=None,
@@ -161,13 +160,14 @@ def create_gdp_dataloaders(metadata_control: pd.DataFrame=None,
     normalize: bool = True,
     zscore: bool = True,
     debug_mode: bool = False,
-    debug_samples: int = 50,
+    debug_samples: int = 256,
     debug_cell_lines: Optional[List[str]] = None,
     debug_drugs: Optional[List[str]] = None,
     smiles_cache: Optional[Dict] = None,
-    split_train_test: bool = False,
+    split_train_test: bool = True,
     test_size: float = 0.2,
     return_datasets: bool = False,  # Add this parameter
+    seed: int = 42,
     **kwargs
     ):
     # Your file paths
@@ -246,7 +246,8 @@ def create_gdp_dataloaders(metadata_control: pd.DataFrame=None,
         debug_mode=debug_mode,
         debug_samples=debug_samples,
         debug_cell_lines=debug_cell_lines,
-        debug_drugs=debug_drugs
+        debug_drugs=debug_drugs,
+        random_state=seed,
     )
     
     logger.info(f"Train samples: {len(train_loader.dataset)}")

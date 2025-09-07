@@ -15,7 +15,6 @@ from .dataloader import DatasetWithDrugs, image_transform, create_raw_drug_datal
 
 logger = logging.getLogger(__name__)
 
-
 def create_lincs_rna_dataloaders(metadata_control: pd.DataFrame=None,
     metadata_drug: pd.DataFrame=None,
     drug_data_path: str=None,
@@ -39,13 +38,16 @@ def create_lincs_rna_dataloaders(metadata_control: pd.DataFrame=None,
     smiles_cache: Optional[Dict] = None,
     split_train_test: bool = False,
     test_size: float = 0.2,
+    seed: int = 42,
+    return_datasets: bool = False,
     **kwargs):
     # Your file paths
     IMAGE_JSON_PATH="N/A"
     DRUG_DATA_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/preprocessed_drug_data.h5"
     RAW_DRUG_CSV_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/chemcpa_lincs_drug.csv"
     METADATA_CONTROL_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/metadata_control.csv"
-    METADATA_DRUG_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/metadata_treatment.csv"
+    # METADATA_DRUG_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/metadata_treatment.csv"
+    METADATA_DRUG_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/metadata_treatment.pubchem_overlap.csv"
     GENE_COUNT_MATRIX_PATH="/depot/natallah/data/Mengbo/dataset/chemCPA_data/gene_counts.parquet"
     COMPOUND_NAME_LABEL="pert_iname" 
 
@@ -66,12 +68,16 @@ def create_lincs_rna_dataloaders(metadata_control: pd.DataFrame=None,
         compound_name_label=COMPOUND_NAME_LABEL,
         debug_mode=debug_mode,
         split_train_test=True,
+        random_state=seed,
     )
 
     logger.info(f"Train samples: {len(train_loader.dataset)}")
     logger.info(f"Test samples: {len(test_loader.dataset)}")
     
-    return train_loader, test_loader
+    if return_datasets:
+        return train_loader.dataset, test_loader.dataset
+    else:
+        return train_loader, test_loader
 
 
 if __name__ == "__main__":

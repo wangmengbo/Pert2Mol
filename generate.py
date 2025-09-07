@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 from models import DiT_models
@@ -17,7 +18,10 @@ import time
 from tqdm import tqdm
 import warnings
 from sklearn.metrics.pairwise import cosine_similarity
+from dataloaders.dataset_gdp import create_gdp_dataloaders
+from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
 warnings.filterwarnings('ignore')
+
 
 @torch.no_grad()
 def sample_with_cfg(model, flow, shape, y_full, pad_mask,
@@ -65,6 +69,7 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         x = x + dt * velocity 
     return x
 
+
 def exact_retrieval(query_features, training_data, top_k=5, similarity_metric='cosine'):
     """Find most similar biological conditions and return corresponding molecules."""
     
@@ -100,6 +105,7 @@ def exact_retrieval(query_features, training_data, top_k=5, similarity_metric='c
     
     return retrieved_smiles, similarity_scores
 
+
 def estimate_generation_confidence(model, flow, x_final, y_features, pad_mask, device):
     """Estimate confidence of generated molecules using multiple metrics."""
     
@@ -131,6 +137,7 @@ def estimate_generation_confidence(model, flow, x_final, y_features, pad_mask, d
         
     return overall_confidence.cpu()
 
+
 def basic_validity_check(smiles):
     """Basic SMILES validity check using RDKit."""
     try:
@@ -144,8 +151,10 @@ def basic_validity_check(smiles):
     except:
         return False, ""
 
+
 @torch.no_grad()
 def main(args):
+    global create_data_loader
     """Streamlined molecule generation with minimal evaluation."""
     torch.backends.cuda.matmul.allow_tf32 = True
     assert torch.cuda.is_available(), "Inference requires GPU"
@@ -158,14 +167,6 @@ def main(args):
 
     if args.ckpt is None:
         raise ValueError("Please specify checkpoint path with --ckpt")
-
-    # Load data
-    metadata_control = pd.read_csv(args.metadata_control_path)
-    metadata_drug = pd.read_csv(args.metadata_drug_path)
-    gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
-    if args.transpose_gene_count_matrix:
-        gene_count_matrix = gene_count_matrix.T
-    print(f"Loaded gene matrix: {gene_count_matrix.shape}")
 
     # Create DiT model
     latent_size = 127
@@ -228,25 +229,24 @@ def main(args):
     flow = create_rectified_flow(num_timesteps=1000)
 
     # Create dataloader
-    loader = create_raw_drug_dataloader(
+    loader = create_data_loader(
         metadata_control=metadata_control,
-        metadata_drug=metadata_drug,
+        metadata_drug=metadata_drug, 
         gene_count_matrix=gene_count_matrix,
         image_json_path=args.image_json_path,
         drug_data_path=args.drug_data_path,
         raw_drug_csv_path=args.raw_drug_csv_path,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
         compound_name_label=args.compound_name_label,
-        split_train_test=args.split_train_test,
         debug_mode=args.debug_mode,
         debug_samples=50,
+        split_train_test=args.split_train_test
     )
 
     if args.split_train_test:
         loader = loader[1]
-        loader.set_shuffle(True)
+        # loader.set_shuffle(True)
 
     print(f"Created dataloader with {len(loader)} batches")
 
@@ -529,8 +529,9 @@ def main(args):
         print(f"  {method}: {count} ({count/len(results)*100:.1f}%)")
 
     # Save results
-    output_base = f"generated_molecules_{args.inference_mode}_{args.global_seed}"
-    
+    output_base = f"{os.path.dirname(os.path.dirname(args.ckpt))}/generated_molecules_{args.inference_mode}_{args.global_seed}"
+    print(f"Saving results to {output_base}.json and .tsv")
+
     # Save detailed results as JSON
     results_json = {
         'metadata': {
@@ -574,6 +575,7 @@ def main(args):
     
     return results
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
@@ -581,6 +583,7 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")
     
     # Data paths
+    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "other"], default="gdp")
     parser.add_argument("--image-json-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json")
     parser.add_argument("--drug-data-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl")
     parser.add_argument("--raw-drug-csv-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv")
@@ -591,10 +594,10 @@ if __name__ == "__main__":
     parser.add_argument("--transpose-gene-count-matrix", action="store_true", default=False)
 
     # Generation parameters
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-samples-per-condition", type=int, default=3)
     parser.add_argument("--num-sampling-steps", type=int, default=50)
-    parser.add_argument("--max-batches", type=int, default=50)
+    parser.add_argument("--max-batches", type=int, default=16)
     parser.add_argument("--global-seed", type=int, default=42)
     parser.add_argument("--debug-mode", action="store_true")
     parser.add_argument("--split-train-test", action="store_true")
@@ -610,4 +613,39 @@ if __name__ == "__main__":
                        help='Similarity metric for retrieval mode')
     
     args = parser.parse_args()
+
+    gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
+
+    if args.dataset == "gdp":
+        create_data_loader = create_gdp_dataloaders
+    elif args.dataset == "lincs_rna":
+        create_data_loader = create_lincs_rna_dataloaders
+        gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "other":
+        for i in ["image_json_path", "gene_count_matrix_path"]:
+            try:
+                if args.__dict__[i] is not None:
+                    assert os.path.exists(args.__dict__[i]), f"Cannot find {args.__dict__[i]}."
+            except Exception as e:
+                print(e, f"; Reset {i} to None")
+                args.__dict__[i] = None
+        assert not (args.image_json_path is None and args.gene_count_matrix_path is None), "Warning: Both image_json_path and gene_count_matrix_path are None. At least one must be provided."
+
+        if args.transpose_gene_count_matrix:
+            gene_count_matrix = gene_count_matrix.T
+        
+        create_data_loader = create_raw_drug_dataloader
+    else:
+        raise ValueError(f"Unknown dataset {args.dataset}.")
+
+    print(f"create_data_loader: {create_data_loader}")
+
+    metadata_control = metadata_drug = None
+    if args.metadata_control_path is not None:
+        metadata_control = pd.read_csv(args.metadata_control_path)
+    
+    if args.metadata_drug_path is not None:
+        metadata_drug = pd.read_csv(args.metadata_drug_path)
+
     main(args)
+

@@ -5,7 +5,15 @@ import torch
 from torch.distributions.categorical import Categorical
 from rdkit import RDLogger
 import re
+import multiprocessing as mp
+from functools import partial
+import pandas as pd
+from rdkit import Chem
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
 RDLogger.DisableLog('rdApp.*')
+
 
 @torch.no_grad()
 def AE_SMILES_encoder(sm, ae_model):
@@ -265,3 +273,197 @@ class regexTokenizer():
             res = res[:self.max_len]
             # res[-1] = self.sep_token_id
         return token_length, torch.LongTensor([res])
+
+
+
+def standardize_smiles_single(smiles_data):
+    """
+    Standardize a single SMILES or a tuple of (index, smiles).
+    
+    Args:
+        smiles_data: Either a SMILES string or tuple of (index, smiles)
+    
+    Returns:
+        Standardized SMILES string or tuple of (index, standardized_smiles)
+    """
+    # Handle both single SMILES and (index, smiles) tuples
+    if isinstance(smiles_data, tuple):
+        index, smiles = smiles_data
+        return_tuple = True
+    else:
+        smiles = smiles_data
+        return_tuple = False
+    
+    # Handle None, NaN, or empty strings
+    if not smiles or pd.isna(smiles):
+        result = None
+    else:
+        try:
+            # Clean and parse SMILES
+            clean_smiles = str(smiles).strip()
+            mol = Chem.MolFromSmiles(clean_smiles)
+            
+            if mol is None:
+                result = None
+            else:
+                # Standardize with consistent parameters
+                result = Chem.MolToSmiles(
+                    mol,
+                    canonical=True,
+                    isomericSmiles=True,  # Preserve stereochemistry
+                    kekuleSmiles=False
+                )
+        except Exception as e:
+            result = None
+            raise e
+    
+    return (index, result) if return_tuple else result
+
+
+def standardize_smiles_multiprocess(smiles_list, 
+                                  n_processes=None, 
+                                  chunk_size=None, 
+                                  show_progress=True,
+                                  preserve_order=True):
+    """
+    Standardize a list of SMILES using multiprocessing.
+    
+    Args:
+        smiles_list (list): List of SMILES strings to standardize
+        n_processes (int, optional): Number of processes to use. Defaults to CPU count.
+        chunk_size (int, optional): Chunk size for multiprocessing. Auto-calculated if None.
+        show_progress (bool): Whether to show progress bar
+        preserve_order (bool): Whether to preserve the original order of SMILES
+    
+    Returns:
+        list: List of standardized SMILES (None for invalid SMILES)
+    """
+    if not smiles_list:
+        return []
+    
+    # Set default parameters
+    if n_processes is None:
+        n_processes = min(mp.cpu_count(), len(smiles_list))
+    
+    if chunk_size is None:
+        # Auto-calculate chunk size based on list length and process count
+        chunk_size = max(1, len(smiles_list) // (n_processes * 4))
+    
+    # For small lists, use single processing to avoid overhead
+    if len(smiles_list) < 100:
+        if show_progress:
+            return [standardize_smiles_single(smi) for smi in tqdm(smiles_list, desc="Standardizing SMILES")]
+        else:
+            return [standardize_smiles_single(smi) for smi in smiles_list]
+    
+    # Prepare data for multiprocessing
+    if preserve_order:
+        # Include indices to preserve order
+        indexed_data = [(i, smi) for i, smi in enumerate(smiles_list)]
+        worker_func = standardize_smiles_single
+    else:
+        indexed_data = smiles_list
+        worker_func = standardize_smiles_single
+    
+    # Use multiprocessing
+    try:
+        with mp.Pool(processes=n_processes) as pool:
+            if show_progress:
+                # Use imap for progress tracking
+                results = list(tqdm(
+                    pool.imap(worker_func, indexed_data, chunksize=chunk_size),
+                    total=len(indexed_data),
+                    desc=f"Standardizing SMILES ({n_processes} processes)"
+                ))
+            else:
+                results = pool.map(worker_func, indexed_data, chunksize=chunk_size)
+    
+    except Exception as e:
+        print(f"Multiprocessing failed: {e}. Falling back to single processing.")
+        if show_progress:
+            return [standardize_smiles_single(smi) for smi in tqdm(smiles_list, desc="Standardizing SMILES (fallback)")]
+        else:
+            return [standardize_smiles_single(smi) for smi in smiles_list]
+    
+    # Process results
+    if preserve_order:
+        # Sort by original index and extract standardized SMILES
+        results.sort(key=lambda x: x[0])
+        standardized_smiles = [result[1] for result in results]
+    else:
+        standardized_smiles = results
+    
+    return standardized_smiles
+
+
+def standardize_smiles_batch_with_stats(smiles_list, 
+                                      n_processes=None, 
+                                      chunk_size=None,
+                                      show_progress=True,
+                                      return_mapping=False):
+    """
+    Standardize SMILES with detailed statistics and optional mapping.
+    
+    Args:
+        smiles_list (list): List of SMILES strings
+        n_processes (int, optional): Number of processes
+        chunk_size (int, optional): Chunk size for multiprocessing
+        show_progress (bool): Show progress bar
+        return_mapping (bool): Return mapping of original -> standardized SMILES
+    
+    Returns:
+        dict: Contains 'standardized_smiles', 'stats', and optionally 'mapping'
+    """
+    original_count = len(smiles_list)
+    
+    # Standardize SMILES
+    standardized = standardize_smiles_multiprocess(
+        smiles_list, 
+        n_processes=n_processes,
+        chunk_size=chunk_size,
+        show_progress=show_progress
+    )
+    
+    # Calculate statistics
+    valid_count = sum(1 for smi in standardized if smi is not None)
+    invalid_count = original_count - valid_count
+    
+    # Remove duplicates while preserving order
+    unique_standardized = []
+    seen = set()
+    for smi in standardized:
+        if smi is not None and smi not in seen:
+            unique_standardized.append(smi)
+            seen.add(smi)
+        elif smi is None:
+            unique_standardized.append(None)
+    
+    unique_valid_count = len(seen)
+    duplicate_count = valid_count - unique_valid_count
+    
+    stats = {
+        'original_count': original_count,
+        'valid_count': valid_count,
+        'invalid_count': invalid_count,
+        'validity_rate': valid_count / original_count if original_count > 0 else 0,
+        'unique_valid_count': unique_valid_count,
+        'duplicate_count': duplicate_count,
+        'uniqueness_rate': unique_valid_count / valid_count if valid_count > 0 else 0
+    }
+    
+    result = {
+        'standardized_smiles': standardized,
+        'unique_standardized_smiles': [smi for smi in unique_standardized if smi is not None],
+        'stats': stats
+    }
+    
+    # Optionally return mapping
+    if return_mapping:
+        mapping = {}
+        for orig, std in zip(smiles_list, standardized):
+            if std is not None:
+                mapping[orig] = std
+        result['mapping'] = mapping
+    
+    return result
+

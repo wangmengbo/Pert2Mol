@@ -28,10 +28,12 @@ import sys
 import os
 
 from models import DiT_models
+from models_sra import DiT_SRA_models, EMAManager, compute_sra_loss
 from train_autoencoder import ldmol_autoencoder
 from utils import AE_SMILES_encoder, regexTokenizer, dual_rna_image_encoder # molT5_encoder,
 import random
 
+import json
 from encoders import ImageEncoder, RNAEncoder
 from dataloaders.dataloader import create_raw_drug_dataloader
 from dataloaders.dataset_gdp import create_gdp_dataloaders
@@ -172,10 +174,9 @@ def create_dirs(args):
     os.makedirs(checkpoint_dir, exist_ok=True)
     return experiment_dir, checkpoint_dir
 
-
 def main(args):
     """
-    Trains a new DiT model with flexible single/multi-GPU support.
+    Trains a new DiT model with SRA enhancement and flexible single/multi-GPU support.
     """
     global create_data_loader, gene_count_matrix, metadata_control, metadata_drug
 
@@ -258,23 +259,29 @@ def main(args):
         use_ddp = False
         batch_size = args.global_batch_size
 
-    # Create model:
+    # Create SRA-enhanced model:
+    from models_sra import DiT_SRA_models, EMAManager, compute_sra_loss
+    
     latent_size = 127
     in_channels = 64
     cross_attn = 192
     conditioning_dim = 192
     
-    model = DiT_models[args.model](
+    model = DiT_SRA_models[args.model](
         input_size=latent_size,
         in_channels=in_channels,
         cross_attn=cross_attn,
-        condition_dim=conditioning_dim
+        condition_dim=conditioning_dim,
+        use_sra=args.use_sra,
+        sra_layer_student=args.sra_layer_student,
+        sra_layer_teacher=args.sra_layer_teacher,
+        sra_projection_dim=args.sra_projection_dim
     )
 
     if args.ckpt:
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
-        msg = model.load_state_dict(state_dict, strict=True)
+        msg = model.load_state_dict(state_dict, strict=False)  # strict=False for SRA compatibility
         if not use_ddp or rank == 0:
             print('load DiT from ', ckpt_path, msg)
 
@@ -286,11 +293,17 @@ def main(args):
         model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
     else:
         model = model.to(device)
+
+    # Initialize SRA teacher manager AFTER DDP wrapping
+    sra_teacher_manager = None
+    if args.use_sra:
+        sra_teacher_manager = EMAManager(model.module if use_ddp else model, ema_decay=args.sra_ema_decay)
+        if not use_ddp or rank == 0:
+            print(f"SRA enabled: student_layer={args.sra_layer_student}, teacher_layer={args.sra_layer_teacher}, lambda={args.sra_lambda}")
         
-    # diffusion = create_diffusion(timestep_respacing="")
     flow = create_rectified_flow(num_timesteps=1000)
 
-    # Load autoencoder
+    # Load autoencoder (unchanged)
     ae_config = {
         'bert_config_decoder': './config_decoder.json',
         'bert_config_encoder': './config_encoder.json',
@@ -321,7 +334,7 @@ def main(args):
 
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Setup image encoder
+    # Setup image encoder (unchanged)
     image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
     if use_ddp:
         image_encoder = DDP(image_encoder, device_ids=[rank], find_unused_parameters=True)
@@ -332,7 +345,7 @@ def main(args):
     if not use_ddp or rank == 0:
         print(f'ImageEncoder #parameters: {sum(p.numel() for p in image_encoder.parameters())}, #trainable: {sum(p.numel() for p in image_encoder.parameters() if p.requires_grad)}')
 
-    # Setup rna encoder
+    # Setup rna encoder (unchanged)
     rna_encoder = RNAEncoder(input_dim=gene_count_matrix.shape[0],output_dim=64,dropout=0.1).to(device)
     if use_ddp:
         rna_encoder = DDP(rna_encoder, device_ids=[rank], find_unused_parameters=True)
@@ -342,7 +355,7 @@ def main(args):
     if not use_ddp or rank == 0:
         print(f'RNAEncoder #parameters: {sum(p.numel() for p in rna_encoder.parameters())}, #trainable: {sum(p.numel() for p in rna_encoder.parameters() if p.requires_grad)}')
 
-    # Create optimizer
+    # Create optimizer - include SRA projection head if enabled
     if use_ddp:
         all_params = list(model.parameters()) + list(image_encoder.parameters()) + list(rna_encoder.parameters())
     else:
@@ -352,9 +365,8 @@ def main(args):
         print(f"Total parameters: {sum(p.numel() for p in all_params):,}, trainable: {sum(p.numel() for p in all_params if p.requires_grad):,}")
     opt = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=0)
 
-    # Setup data
+    # Setup data (unchanged)
     if use_ddp:
-        # For DDP, we need datasets first, then create samplers
         train_dataset, test_dataset = create_data_loader(
             metadata_control=metadata_control,
             metadata_drug=metadata_drug, 
@@ -363,15 +375,14 @@ def main(args):
             drug_data_path=args.drug_data_path,
             raw_drug_csv_path=args.raw_drug_csv_path,
             batch_size=batch_size,
-            shuffle=False,  # Don't shuffle here, sampler will handle it
+            shuffle=False,
             num_workers=args.num_workers,
             compound_name_label=args.compound_name_label,
             debug_mode=args.debug_mode,
             split_train_test=True,
-            return_datasets=True,  # New parameter to return datasets instead of loaders
+            return_datasets=True,
         )
         
-        # Create distributed samplers
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=dist.get_world_size(),
@@ -385,7 +396,6 @@ def main(args):
             shuffle=False
         )
         
-        # Create loaders with samplers
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -401,7 +411,6 @@ def main(args):
             pin_memory=True
         )
     else:
-        # Single GPU - use existing approach
         train_loader, test_loader = create_data_loader(
             metadata_control=metadata_control,
             metadata_drug=metadata_drug, 
@@ -425,10 +434,12 @@ def main(args):
     model.train()
     ema.eval()
 
-    # Training loop
+    # Training loop with SRA
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    running_flow_loss = 0
+    running_sra_loss = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
@@ -452,35 +463,78 @@ def main(args):
                 image_encoder, rna_encoder, device
             )
 
-            # CFG training with three conditioning variants
+            # CFG training with three conditioning variants (unchanged)
             dropout_choice = torch.rand(y.shape[0], device=device)
-
-            # 0.0-0.1: RNA-only (zero out image features)
-            # 0.1-0.2: Image-only (zero out RNA features) 
-            # 0.2-1.0: Full conditioning
-
             rna_only_mask = (dropout_choice < 0.1).float().view(-1, 1, 1)
             image_only_mask = ((dropout_choice >= 0.1) & (dropout_choice < 0.2)).float().view(-1, 1, 1)
 
-            # Apply masks
-            y[:, :, :128] = y[:, :, :128] * (1 - rna_only_mask)  # Zero out images for RNA-only
-            y[:, :, 128:] = y[:, :, 128:] * (1 - image_only_mask)  # Zero out RNA for image-only
+            y[:, :, :128] = y[:, :, :128] * (1 - rna_only_mask)
+            y[:, :, 128:] = y[:, :, 128:] * (1 - image_only_mask)
 
             model_kwargs = dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
-            loss_dict = flow.training_losses(model, x, model_kwargs=model_kwargs)
-            loss = loss_dict["loss"].mean()
+            
+            # Forward pass for student (higher noise)
+            student_model = model.module if use_ddp else model
+            # Modify training_losses to handle tuple return from SRA model
+            def model_wrapper(x_input, t_input, **kwargs):
+                output, _ = student_model(x_input, t_input, **kwargs)
+                return output
+            loss_dict = flow.training_losses(model_wrapper, x, model_kwargs=model_kwargs)
+            flow_loss = loss_dict["loss"].mean()
+            
+            # SRA loss computation
+            sra_loss = torch.tensor(0.0, device=device)
+            if args.use_sra and sra_teacher_manager is not None:
+                # Sample timestep offset for teacher (lower noise)
+                teacher_timestep_offset = torch.randint(1, args.sra_timestep_offset_max + 1, (1,)).item()
+                
+                # Get student representation (from current forward pass)
+                with torch.no_grad():
+                    current_t = flow.sample_time(x.shape[0], device)
+                    _, student_repr = student_model.forward(
+                        x, current_t, y=y.type(torch.float32), pad_mask=pad_mask.bool()
+                    )
+                
+                # Get teacher representation (with lower noise)
+                teacher_model = sra_teacher_manager.get_teacher()
+                teacher_model.eval()
+                with torch.no_grad():
+                    _, teacher_repr = teacher_model.forward(
+                        x, current_t, y=y.type(torch.float32), pad_mask=pad_mask.bool(),
+                        teacher_mode=True, teacher_timestep_offset=teacher_timestep_offset
+                    )
+                
+                # Compute SRA alignment loss
+                sra_loss = compute_sra_loss(
+                    student_repr, teacher_repr, 
+                    student_model.sra_projection_head if hasattr(student_model, 'sra_projection_head') else student_model.module.sra_projection_head,
+                    distance_type=args.sra_distance_type
+                )
+            
+            # Total loss
+            total_loss = flow_loss + args.sra_lambda * sra_loss
             
             opt.zero_grad()
-            loss.backward()
+            total_loss.backward()
             opt.step()
             
+            # Update EMA networks
             if use_ddp:
                 update_ema(ema, model.module)
             else:
                 update_ema(ema, model)
+                
+            # Update SRA teacher
+            if args.use_sra and sra_teacher_manager is not None:
+                if use_ddp:
+                    sra_teacher_manager.update_teacher(model.module)
+                else:
+                    sra_teacher_manager.update_teacher(model)
 
             # Logging
-            running_loss += loss.item()
+            running_loss += total_loss.item()
+            running_flow_loss += flow_loss.item()
+            running_sra_loss += sra_loss.item()
             log_steps += 1
             train_steps += 1
             
@@ -490,16 +544,33 @@ def main(args):
                 steps_per_sec = log_steps / (end_time - start_time)
                 
                 if use_ddp:
-                    # Reduce loss across all processes
-                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                    avg_loss = avg_loss.item() / dist.get_world_size()
+                    # Reduce losses across all processes
+                    avg_total_loss = torch.tensor(running_loss / log_steps, device=device)
+                    avg_flow_loss = torch.tensor(running_flow_loss / log_steps, device=device)
+                    avg_sra_loss = torch.tensor(running_sra_loss / log_steps, device=device)
+                    
+                    dist.all_reduce(avg_total_loss, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_flow_loss, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_sra_loss, op=dist.ReduceOp.SUM)
+                    
+                    avg_total_loss = avg_total_loss.item() / dist.get_world_size()
+                    avg_flow_loss = avg_flow_loss.item() / dist.get_world_size()
+                    avg_sra_loss = avg_sra_loss.item() / dist.get_world_size()
                 else:
-                    avg_loss = running_loss / log_steps
+                    avg_total_loss = running_loss / log_steps
+                    avg_flow_loss = running_flow_loss / log_steps
+                    avg_sra_loss = running_sra_loss / log_steps
                 
                 if not use_ddp or rank == 0:
-                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                    log_msg = f"(step={train_steps:07d}) Total Loss: {avg_total_loss:.4f}, Flow Loss: {avg_flow_loss:.4f}"
+                    if args.use_sra:
+                        log_msg += f", SRA Loss: {avg_sra_loss:.4f}"
+                    log_msg += f", Train Steps/Sec: {steps_per_sec:.2f}"
+                    logger.info(log_msg)
+                    
                 running_loss = 0
+                running_flow_loss = 0
+                running_sra_loss = 0
                 log_steps = 0
                 start_time = time()
 
@@ -515,6 +586,8 @@ def main(args):
                             "opt": opt.state_dict(),
                             "args": args
                         }
+                        if args.use_sra and sra_teacher_manager is not None:
+                            checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
                     else:
                         checkpoint = {
                             "model": model.state_dict(),
@@ -524,6 +597,9 @@ def main(args):
                             "opt": opt.state_dict(),
                             "args": args
                         }
+                        if args.use_sra and sra_teacher_manager is not None:
+                            checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+                            
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
@@ -539,6 +615,15 @@ def main(args):
 
 
 def get_hash(namespace):
+    """
+    Generate an 8-character hash from argparse Namespace object.
+    
+    Args:
+        namespace: argparse.Namespace object from parse_args()
+        
+    Returns:
+        str: 8-character hexadecimal hash
+    """
     # Convert namespace to dict and create hash
     data = json.dumps(vars(namespace), sort_keys=True, default=str)
     return hashlib.sha256(data.encode()).hexdigest()[:8]
@@ -549,13 +634,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
+    # parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
+    parser.add_argument("--model", type=str, choices=list(DiT_SRA_models.keys()), default="LDMolSRA")
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--global-batch-size", type=int, default=128) # Effective batch size (sum over all GPUs)
+    parser.add_argument("--global-batch-size", type=int, default=32) # Effective batch size (sum over all GPUs)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=16)
-    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--use-distributed", action="store_true", help="Enable distributed training across multiple GPUs")
     parser.add_argument("--prefix", type=str, default=None)
@@ -568,7 +654,17 @@ if __name__ == "__main__":
     parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
     parser.add_argument("--compound-name-label", type=str, default="compound")
     parser.add_argument("--transpose-gene-count-matrix", action='store_true', default=False)
-    parser.add_argument("--debug-mode", action='store_true', default=False)
+    parser.add_argument("--debug-mode", action='store_true', default=True)
+
+    # Add these SRA-related arguments after your existing arguments
+    parser.add_argument("--use-sra", action="store_true", default=True, help="Enable Self-Representation Alignment")
+    parser.add_argument("--sra-lambda", type=float, default=0.1, help="Weight for SRA loss")
+    parser.add_argument("--sra-layer-student", type=int, default=4, help="Student layer for SRA extraction")
+    parser.add_argument("--sra-layer-teacher", type=int, default=8, help="Teacher layer for SRA extraction") 
+    parser.add_argument("--sra-projection-dim", type=int, default=None, help="SRA projection head output dim")
+    parser.add_argument("--sra-ema-decay", type=float, default=0.9999, help="EMA decay for SRA teacher")
+    parser.add_argument("--sra-distance-type", type=str, default="mse", choices=["mse", "cosine"], help="Distance function for SRA loss")
+    parser.add_argument("--sra-timestep-offset-max", type=int, default=50, help="Maximum timestep offset for teacher (lower noise)")
 
     args = parser.parse_args()
     print(args)
@@ -607,3 +703,4 @@ if __name__ == "__main__":
         metadata_drug = pd.read_csv(args.metadata_drug_path)
 
     main(args)
+

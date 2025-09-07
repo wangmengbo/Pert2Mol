@@ -1,3 +1,4 @@
+import os
 import json
 import pickle
 import pandas as pd
@@ -20,6 +21,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict, Counter
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+
+from utils import standardize_smiles_batch_with_stats, standardize_smiles_single
 
 
 class ComprehensiveMolecularEvaluator:
@@ -186,6 +189,112 @@ class ComprehensiveMolecularEvaluator:
             return 0.0, 'error'
 
 
+# def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0.9]):
+#     """Calculate retrieval accuracy, precision, recall, F1 for different similarity thresholds."""
+    
+#     retrieval_results = [r for r in results if r.get('method') == 'retrieval' and r.get('is_valid', False)]
+    
+#     if not retrieval_results:
+#         return {}
+    
+#     metrics_by_threshold = {}
+    
+#     for threshold in similarity_thresholds:
+#         # Classification based on similarity threshold
+#         true_positives = 0
+#         false_positives = 0 
+#         false_negatives = 0
+#         true_negatives = 0
+        
+#         exact_matches = 0
+#         top_k_hits = 0
+#         total_samples = len(retrieval_results)
+        
+#         for result in retrieval_results:
+#             target_smiles = result['target_smiles']
+#             generated_smiles = result['generated_smiles']
+#             all_candidates = result.get('all_candidates', [])
+            
+#             # Calculate similarity between target and generated
+#             similarity_score = 0.0
+#             if 'similarity_analysis' in result:
+#                 # Use Morgan fingerprint similarity as main metric
+#                 similarity_score = result['similarity_analysis'].get('morgan_r2', 0.0)
+            
+#             # Exact match check
+#             if target_smiles == generated_smiles:
+#                 exact_matches += 1
+            
+#             # Top-k hit check (target in any candidate)
+#             target_in_candidates = target_smiles in all_candidates
+#             if target_in_candidates:
+#                 top_k_hits += 1
+            
+#             # Get similarity score for this sample
+#             if 'similarity_analysis' in result and 'morgan_r2' in result['similarity_analysis']:
+#                 similarity_score = result['similarity_analysis']['morgan_r2']
+#             else:
+#                 similarity_score = 0.0
+            
+#             # Binary classification based on similarity threshold
+#             predicted_positive = similarity_score >= threshold
+            
+#             # Ground truth: exact molecular match (canonical SMILES)
+#             try:
+#                 target_mol = Chem.MolFromSmiles(target_smiles)
+#                 generated_mol = Chem.MolFromSmiles(generated_smiles)
+                
+#                 if target_mol is not None and generated_mol is not None:
+#                     target_canonical = Chem.MolToSmiles(target_mol, canonical=True)
+#                     generated_canonical = Chem.MolToSmiles(generated_mol, canonical=True)
+#                     actual_positive = target_canonical == generated_canonical
+#                 else:
+#                     actual_positive = False
+#             except:
+#                 actual_positive = target_smiles == generated_smiles  # Fallback to string match
+            
+#             if predicted_positive and actual_positive:
+#                 true_positives += 1
+#             elif predicted_positive and not actual_positive:
+#                 false_positives += 1
+#             elif not predicted_positive and actual_positive:
+#                 false_negatives += 1
+#             else:
+#                 true_negatives += 1
+        
+#         # Calculate metrics
+#         precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+#         recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+#         f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+#         accuracy = (true_positives + true_negatives) / total_samples if total_samples > 0 else 0.0
+        
+#         metrics_by_threshold[f'threshold_{threshold}'] = {
+#             'threshold': threshold,
+#             'precision': precision,
+#             'recall': recall,
+#             'f1_score': f1_score,
+#             'accuracy': accuracy,
+#             'true_positives': true_positives,
+#             'false_positives': false_positives,
+#             'true_negatives': true_negatives,
+#             'false_negatives': false_negatives
+#         }
+    
+#     # Overall retrieval metrics (threshold-independent)
+#     overall_metrics = {
+#         'exact_match_accuracy': exact_matches / total_samples if total_samples > 0 else 0.0,
+#         'top_k_hit_rate': top_k_hits / total_samples if total_samples > 0 else 0.0,
+#         'exact_matches': exact_matches,
+#         'top_k_hits': top_k_hits,
+#         'total_samples': total_samples
+#     }
+    
+#     return {
+#         'threshold_based_metrics': metrics_by_threshold,
+#         'overall_retrieval_metrics': overall_metrics
+#     }
+
+
 def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0.9]):
     """Calculate retrieval accuracy, precision, recall, F1 for different similarity thresholds."""
     
@@ -195,6 +304,9 @@ def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0
         return {}
     
     metrics_by_threshold = {}
+    
+    # Add evaluator instance for similarity calculations
+    evaluator = ComprehensiveMolecularEvaluator()
     
     for threshold in similarity_thresholds:
         # Classification based on similarity threshold
@@ -207,36 +319,73 @@ def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0
         top_k_hits = 0
         total_samples = len(retrieval_results)
         
+        # New: similarity-based matches
+        similarity_matches = 0
+        property_similar_matches = 0
+        
         for result in retrieval_results:
             target_smiles = result['target_smiles']
             generated_smiles = result['generated_smiles']
             all_candidates = result.get('all_candidates', [])
             
-            # Calculate similarity between target and generated
-            similarity_score = 0.0
-            if 'similarity_analysis' in result:
-                # Use Morgan fingerprint similarity as main metric
-                similarity_score = result['similarity_analysis'].get('morgan_r2', 0.0)
+            # Calculate multiple similarity metrics
+            similarity_scores = evaluator.calculate_multi_fingerprint_similarity(target_smiles, generated_smiles)
+            scaffold_similarity = evaluator.calculate_scaffold_similarity(target_smiles, generated_smiles)
+            
+            # Use Morgan fingerprint similarity as primary metric
+            primary_similarity = similarity_scores.get('morgan_r2', 0.0)
             
             # Exact match check
             if target_smiles == generated_smiles:
                 exact_matches += 1
+            
+            # Similarity-based match check
+            if primary_similarity >= threshold:
+                similarity_matches += 1
+            
+            # Property-based similarity check
+            target_props = calculate_comprehensive_molecular_properties(target_smiles)
+            generated_props = calculate_comprehensive_molecular_properties(generated_smiles)
+            
+            property_similarity = 0.0
+            if target_props and generated_props:
+                # Calculate normalized property similarity
+                key_props = ['MW', 'LogP', 'TPSA', 'HBA', 'HBD', 'RotBonds']
+                prop_similarities = []
+                
+                for prop in key_props:
+                    if prop in target_props and prop in generated_props:
+                        target_val = target_props[prop]
+                        generated_val = generated_props[prop]
+                        
+                        # Normalize by range (using typical drug-like ranges)
+                        prop_ranges = {
+                            'MW': 500, 'LogP': 10, 'TPSA': 200, 
+                            'HBA': 15, 'HBD': 10, 'RotBonds': 20
+                        }
+                        
+                        if prop in prop_ranges and prop_ranges[prop] > 0:
+                            normalized_diff = abs(target_val - generated_val) / prop_ranges[prop]
+                            prop_sim = max(0, 1 - normalized_diff)
+                            prop_similarities.append(prop_sim)
+                
+                if prop_similarities:
+                    property_similarity = np.mean(prop_similarities)
+            
+            if property_similarity >= threshold:
+                property_similar_matches += 1
             
             # Top-k hit check (target in any candidate)
             target_in_candidates = target_smiles in all_candidates
             if target_in_candidates:
                 top_k_hits += 1
             
-            # Get similarity score for this sample
-            if 'similarity_analysis' in result and 'morgan_r2' in result['similarity_analysis']:
-                similarity_score = result['similarity_analysis']['morgan_r2']
-            else:
-                similarity_score = 0.0
-            
             # Binary classification based on similarity threshold
-            predicted_positive = similarity_score >= threshold
+            predicted_positive = primary_similarity >= threshold
             
-            # Ground truth: exact molecular match (canonical SMILES)
+            # Ground truth options - you can choose which one to use:
+            
+            # Option 1: Exact molecular match (your current approach)
             try:
                 target_mol = Chem.MolFromSmiles(target_smiles)
                 generated_mol = Chem.MolFromSmiles(generated_smiles)
@@ -244,11 +393,28 @@ def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0
                 if target_mol is not None and generated_mol is not None:
                     target_canonical = Chem.MolToSmiles(target_mol, canonical=True)
                     generated_canonical = Chem.MolToSmiles(generated_mol, canonical=True)
-                    actual_positive = target_canonical == generated_canonical
+                    actual_positive_exact = target_canonical == generated_canonical
                 else:
-                    actual_positive = False
+                    actual_positive_exact = False
             except:
-                actual_positive = target_smiles == generated_smiles  # Fallback to string match
+                actual_positive_exact = target_smiles == generated_smiles
+            
+            # Option 2: Similarity-based ground truth (more flexible)
+            actual_positive_similarity = primary_similarity >= 0.8  # High similarity threshold for "ground truth"
+            
+            # Option 3: Multi-criteria ground truth
+            multi_criteria_score = (
+                similarity_scores.get('morgan_r2', 0) * 0.4 +
+                similarity_scores.get('maccs', 0) * 0.2 +
+                scaffold_similarity * 0.2 +
+                property_similarity * 0.2
+            )
+            actual_positive_multi = multi_criteria_score >= 0.7
+            
+            # Choose which ground truth to use (you can switch between these)
+            actual_positive = actual_positive_exact  # Default to exact match
+            # actual_positive = actual_positive_similarity  # Uncomment for similarity-based
+            # actual_positive = actual_positive_multi  # Uncomment for multi-criteria
             
             if predicted_positive and actual_positive:
                 true_positives += 1
@@ -274,7 +440,12 @@ def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0
             'true_positives': true_positives,
             'false_positives': false_positives,
             'true_negatives': true_negatives,
-            'false_negatives': false_negatives
+            'false_negatives': false_negatives,
+            # New similarity-based metrics
+            'similarity_matches': similarity_matches,
+            'property_similar_matches': property_similar_matches,
+            'similarity_match_rate': similarity_matches / total_samples if total_samples > 0 else 0.0,
+            'property_similarity_rate': property_similar_matches / total_samples if total_samples > 0 else 0.0
         }
     
     # Overall retrieval metrics (threshold-independent)
@@ -399,6 +570,225 @@ def calculate_comprehensive_molecular_properties(smiles):
     except Exception as e:
         print(f"Failed to process SMILES {smiles}: {e}")
         return None
+
+
+def calculate_comprehensive_similarity_metrics(results, similarity_thresholds=[0.3, 0.5, 0.7, 0.8, 0.9]):
+    """
+    Calculate comprehensive similarity-based evaluation metrics beyond exact matches.
+    
+    Args:
+        results: List of evaluation results
+        similarity_thresholds: List of similarity thresholds to evaluate
+    
+    Returns:
+        Dictionary with comprehensive similarity metrics
+    """
+    valid_results = [r for r in results if r.get('is_valid', False)]
+    
+    if not valid_results:
+        return {}
+    
+    evaluator = ComprehensiveMolecularEvaluator()
+    
+    # Initialize metrics storage
+    similarity_metrics = {
+        'fingerprint_similarities': [],
+        'scaffold_similarities': [],
+        'property_similarities': [],
+        'multi_criteria_similarities': [],
+        'similarity_distribution': {},
+        'threshold_performance': {}
+    }
+    
+    print("Calculating comprehensive similarity metrics...")
+    
+    for result in tqdm(valid_results, desc="Computing similarities"):
+        target_smiles = result['target_smiles']
+        generated_smiles = result['generated_smiles']
+        
+        # Calculate multiple fingerprint similarities
+        fp_similarities = evaluator.calculate_multi_fingerprint_similarity(target_smiles, generated_smiles)
+        scaffold_sim = evaluator.calculate_scaffold_similarity(target_smiles, generated_smiles)
+        
+        # Calculate property-based similarity
+        target_props = calculate_comprehensive_molecular_properties(target_smiles)
+        generated_props = calculate_comprehensive_molecular_properties(generated_smiles)
+        
+        property_similarity = calculate_property_similarity(target_props, generated_props)
+        
+        # Calculate multi-criteria similarity score
+        multi_criteria_sim = calculate_multi_criteria_similarity(
+            fp_similarities, scaffold_sim, property_similarity
+        )
+        
+        # Store individual similarities
+        similarity_metrics['fingerprint_similarities'].append(fp_similarities)
+        similarity_metrics['scaffold_similarities'].append(scaffold_sim)
+        similarity_metrics['property_similarities'].append(property_similarity)
+        similarity_metrics['multi_criteria_similarities'].append(multi_criteria_sim)
+        
+        # Store in result for later use
+        result['comprehensive_similarity'] = {
+            'fingerprint': fp_similarities,
+            'scaffold': scaffold_sim,
+            'property': property_similarity,
+            'multi_criteria': multi_criteria_sim
+        }
+    
+    # Calculate distribution statistics for each similarity type
+    similarity_types = ['morgan_r2', 'morgan_r3', 'maccs', 'rdk', 'atom_pairs']
+    
+    for sim_type in similarity_types:
+        values = [fp_sim.get(sim_type, 0) for fp_sim in similarity_metrics['fingerprint_similarities']]
+        similarity_metrics['similarity_distribution'][sim_type] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'median': np.median(values),
+            'min': np.min(values),
+            'max': np.max(values),
+            'percentile_25': np.percentile(values, 25),
+            'percentile_75': np.percentile(values, 75)
+        }
+    
+    # Add scaffold and property similarity distributions
+    scaffold_values = similarity_metrics['scaffold_similarities']
+    property_values = similarity_metrics['property_similarities']
+    multi_criteria_values = similarity_metrics['multi_criteria_similarities']
+    
+    for name, values in [('scaffold', scaffold_values), ('property', property_values), ('multi_criteria', multi_criteria_values)]:
+        similarity_metrics['similarity_distribution'][name] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'median': np.median(values),
+            'min': np.min(values),
+            'max': np.max(values),
+            'percentile_25': np.percentile(values, 25),
+            'percentile_75': np.percentile(values, 75)
+        }
+    
+    # Calculate threshold-based performance for different similarity metrics
+    for threshold in similarity_thresholds:
+        threshold_results = {}
+        
+        for sim_type in similarity_types + ['scaffold', 'property', 'multi_criteria']:
+            if sim_type in similarity_types:
+                values = [fp_sim.get(sim_type, 0) for fp_sim in similarity_metrics['fingerprint_similarities']]
+            elif sim_type == 'scaffold':
+                values = scaffold_values
+            elif sim_type == 'property':
+                values = property_values
+            elif sim_type == 'multi_criteria':
+                values = multi_criteria_values
+            
+            # Calculate how many molecules meet the threshold
+            above_threshold = sum(1 for v in values if v >= threshold)
+            threshold_results[sim_type] = {
+                'count_above_threshold': above_threshold,
+                'percentage_above_threshold': above_threshold / len(values) * 100 if values else 0,
+                'mean_above_threshold': np.mean([v for v in values if v >= threshold]) if any(v >= threshold for v in values) else 0
+            }
+        
+        similarity_metrics['threshold_performance'][f'threshold_{threshold}'] = threshold_results
+    
+    # Calculate similarity-based retrieval success rates
+    retrieval_success = {
+        'high_similarity_retrieval': 0,  # Morgan similarity > 0.8
+        'moderate_similarity_retrieval': 0,  # Morgan similarity > 0.5
+        'scaffold_preserved_retrieval': 0,  # Scaffold similarity > 0.7
+        'property_similar_retrieval': 0,  # Property similarity > 0.7
+        'multi_criteria_success': 0  # Multi-criteria > 0.7
+    }
+    
+    total_samples = len(valid_results)
+    
+    for result in valid_results:
+        comp_sim = result.get('comprehensive_similarity', {})
+        fp_sim = comp_sim.get('fingerprint', {})
+        
+        morgan_sim = fp_sim.get('morgan_r2', 0)
+        scaffold_sim = comp_sim.get('scaffold', 0)
+        property_sim = comp_sim.get('property', 0)
+        multi_criteria_sim = comp_sim.get('multi_criteria', 0)
+        
+        if morgan_sim > 0.8:
+            retrieval_success['high_similarity_retrieval'] += 1
+        if morgan_sim > 0.5:
+            retrieval_success['moderate_similarity_retrieval'] += 1
+        if scaffold_sim > 0.7:
+            retrieval_success['scaffold_preserved_retrieval'] += 1
+        if property_sim > 0.7:
+            retrieval_success['property_similar_retrieval'] += 1
+        if multi_criteria_sim > 0.7:
+            retrieval_success['multi_criteria_success'] += 1
+    
+    # Convert to rates - FIX: iterate over a copy of the keys
+    for key in list(retrieval_success.keys()):  # This is the fix - use list() to create a copy
+        retrieval_success[key + '_rate'] = retrieval_success[key] / total_samples if total_samples > 0 else 0
+    
+    similarity_metrics['retrieval_success_rates'] = retrieval_success
+    
+    return similarity_metrics
+
+
+def calculate_property_similarity(props1, props2):
+    """Calculate normalized similarity between molecular properties."""
+    if not props1 or not props2:
+        return 0.0
+    
+    # Key properties for comparison with their typical ranges
+    property_ranges = {
+        'MW': 500,          # Molecular weight
+        'LogP': 10,         # Lipophilicity  
+        'TPSA': 200,        # Topological polar surface area
+        'HBA': 15,          # Hydrogen bond acceptors
+        'HBD': 10,          # Hydrogen bond donors
+        'RotBonds': 20,     # Rotatable bonds
+        'AromaticRings': 5, # Aromatic rings
+        'HeavyAtoms': 50,   # Heavy atom count
+        'QED': 1,           # Drug-likeness score
+        'BertzCT': 1000     # Complexity
+    }
+    
+    similarities = []
+    
+    for prop, range_val in property_ranges.items():
+        if prop in props1 and prop in props2:
+            val1 = props1[prop]
+            val2 = props2[prop]
+            
+            if range_val > 0:
+                # Normalized absolute difference
+                normalized_diff = abs(val1 - val2) / range_val
+                # Convert to similarity (1 - difference, capped at 0)
+                similarity = max(0, 1 - normalized_diff)
+                similarities.append(similarity)
+    
+    return np.mean(similarities) if similarities else 0.0
+
+
+def calculate_multi_criteria_similarity(fp_similarities, scaffold_sim, property_sim):
+    """Calculate weighted multi-criteria similarity score."""
+    # Weights for different similarity components
+    weights = {
+        'morgan_r2': 0.25,      # Most important fingerprint
+        'morgan_r3': 0.15,      # Secondary fingerprint
+        'maccs': 0.15,          # MACCS keys
+        'scaffold': 0.25,       # Scaffold similarity
+        'property': 0.20        # Property similarity
+    }
+    
+    score = 0.0
+    
+    # Fingerprint similarities
+    score += fp_similarities.get('morgan_r2', 0) * weights['morgan_r2']
+    score += fp_similarities.get('morgan_r3', 0) * weights['morgan_r3']
+    score += fp_similarities.get('maccs', 0) * weights['maccs']
+    
+    # Scaffold and property similarities
+    score += scaffold_sim * weights['scaffold']
+    score += property_sim * weights['property']
+    
+    return score
 
 
 def calculate_drug_likeness_score(props):
@@ -683,6 +1073,14 @@ def main():
     with open(args.input_file, 'r') as f:
         data = json.load(f)
     
+    print("Standardizing training data SMILES...")
+    data["training_data"]["smiles"] = standardize_smiles_batch_with_stats(data["training_data"]["smiles"])
+    for i, result in enumerate(data["results"]):
+        converted_smiles = standardize_smiles_single(result["generated_smiles"])
+        # print(f"{result['generated_smiles']==converted_smiles}; before: {result['generated_smiles']}, after:{converted_smiles}")
+        data["results"][i]["generated_smiles"] = converted_smiles
+
+     # Extract metadata and results
     metadata = data['metadata']
     training_data = data.get('training_data', {'smiles': []})
     results = data['results']
@@ -756,6 +1154,9 @@ def main():
     all_generated_smiles = [r['generated_smiles'] for r in valid_results]
     diversity_metrics = diversity_analysis(all_generated_smiles)
     
+    # Comprehensive similarity analysis
+    comprehensive_similarity_metrics = calculate_comprehensive_similarity_metrics(valid_results)
+
     retrieval_metrics = calculate_retrieval_metrics(valid_results)
     multi_candidate_metrics = calculate_multi_candidate_metrics(valid_results)
 
@@ -843,6 +1244,7 @@ def main():
             'method_distribution': dict(method_counts)
         },
         'similarity_analysis': similarity_stats,
+        'comprehensive_similarity_metrics': comprehensive_similarity_metrics,  # Add this line
         'novelty_analysis': {
             'statistics': novelty_stats,
             'primary_method': novelty_method_counts.most_common(1)[0][0] if novelty_method_counts else 'none',
@@ -865,13 +1267,13 @@ def main():
     }
     
     # Save comprehensive results
-    output_json = f"{args.output_prefix}_{metadata['inference_mode']}_{metadata['global_seed']}_comprehensive.json"
+    output_json = f"{os.path.dirname(args.input_file)}/{args.output_prefix}_{metadata['inference_mode']}_{metadata['global_seed']}_comprehensive.json"
     
     with open(output_json, 'w') as f:
         json.dump(comprehensive_summary, f, indent=2, default=str)
     
     # Create human-readable summary
-    output_txt = f"{args.output_prefix}_{metadata['inference_mode']}_{metadata['global_seed']}_summary.txt"
+    output_txt = f"{os.path.dirname(args.input_file)}/{args.output_prefix}_{metadata['inference_mode']}_{metadata['global_seed']}_summary.txt"
     
     with open(output_txt, 'w') as f:
         f.write("COMPREHENSIVE MOLECULAR EVALUATION REPORT\n")
