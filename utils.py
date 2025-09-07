@@ -1,3 +1,5 @@
+# Inspired by LDMOL https://arxiv.org/pdf/2405.17829
+
 from absl import logging
 import numpy as np
 from PIL import Image

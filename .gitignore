@@ -6,6 +6,7 @@
 *.json
 *.tsv
 *.sh
+*.log
 results/
 plots/
 backup/

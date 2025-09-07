@@ -1,3 +1,5 @@
+# Inspired by LDMOL https://arxiv.org/pdf/2405.17829
+
 from xbert import BertConfig, BertForMaskedLM
 from transformers import BertModel
 import torch
