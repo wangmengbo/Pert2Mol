@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-A minimal training script for DiT using PyTorch DDP.
+A minimal training script for ReT using PyTorch DDP.
 """
 import torch
 import hashlib
@@ -27,7 +27,7 @@ import pandas as pd
 import sys
 import os
 
-from models import DiT_models
+from models import ReT_models
 from train_autoencoder import ldmol_autoencoder
 from utils import AE_SMILES_encoder, regexTokenizer, dual_rna_image_encoder # molT5_encoder,
 import random
@@ -175,7 +175,7 @@ def create_dirs(args):
 
 def main(args):
     """
-    Trains a new DiT model with flexible single/multi-GPU support.
+    Trains a new ReT model with flexible single/multi-GPU support.
     """
     global create_data_loader, gene_count_matrix, metadata_control, metadata_drug
 
@@ -264,7 +264,7 @@ def main(args):
     cross_attn = 192
     conditioning_dim = 192
     
-    model = DiT_models[args.model](
+    model = ReT_models[args.model](
         input_size=latent_size,
         in_channels=in_channels,
         cross_attn=cross_attn,
@@ -276,7 +276,7 @@ def main(args):
         state_dict = find_model(ckpt_path)
         msg = model.load_state_dict(state_dict, strict=True)
         if not use_ddp or rank == 0:
-            print('load DiT from ', ckpt_path, msg)
+            print('load ReT from ', ckpt_path, msg)
 
     # Setup model for distributed or single GPU
     ema = deepcopy(model).to(device)
@@ -319,7 +319,7 @@ def main(args):
     if not use_ddp or rank == 0:
         print(f'AE #parameters: {sum(p.numel() for p in ae_model.parameters())}, #trainable: {sum(p.numel() for p in ae_model.parameters() if p.requires_grad)}')
 
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"ReT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup image encoder
     image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
@@ -545,11 +545,11 @@ def get_hash(namespace):
 
 
 if __name__ == "__main__":
-    # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
+    # Default args here will train ReT with the hyperparameters.
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="LDMol")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--global-batch-size", type=int, default=128) # Effective batch size (sum over all GPUs)
     parser.add_argument("--global-seed", type=int, default=0)

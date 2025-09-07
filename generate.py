@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.distributed as dist
-from models import DiT_models
+from models import ReT_models
 from dataloaders.download import find_model
 from diffusion.rectified_flow import create_rectified_flow
 import argparse
@@ -168,7 +168,7 @@ def main(args):
     if args.ckpt is None:
         raise ValueError("Please specify checkpoint path with --ckpt")
 
-    # Create DiT model
+    # Create ReT model
     latent_size = 127
     in_channels = 64
     cross_attn = 192
@@ -185,7 +185,7 @@ def main(args):
     checkpoint = torch.load(args.ckpt, map_location='cpu')
     model.load_state_dict(checkpoint['model'], strict=True)
     model.eval()
-    print(f"Loaded DiT model from {args.ckpt}")
+    print(f"Loaded ReT model from {args.ckpt}")
 
     # Setup encoders
     image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
@@ -578,7 +578,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="LDMol")
     parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/001-LDMol_gdp/checkpoints/0050000.pt')
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")
     

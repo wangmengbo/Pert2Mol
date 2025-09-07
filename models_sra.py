@@ -1,12 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# SRA-enhanced DiT for molecular generation
-# Adapted from SiT paper: Self-Representation Alignment
-# --------------------------------------------------------
+# Inspired by SRA https://arxiv.org/pdf/2505.02831
 
 import torch
 import torch.nn as nn
@@ -23,7 +15,6 @@ from models import (
     modulate, CrossAttention, TimestepEmbedder, RMSNorm, SwiGLU,
     get_1d_sincos_pos_embed_from_grid
 )
-
 
 class ProjectionHead(nn.Module):
     """Lightweight projection head for SRA alignment"""
@@ -42,10 +33,9 @@ class ProjectionHead(nn.Module):
     def forward(self, x):
         return self.projection(x)
 
-
-class DiTBlockSRA(nn.Module):
+class ReTBlockSRA(nn.Module):
     """
-    DiT block with SRA capability - maintains your existing architecture
+    ReT block with SRA capability - maintains existing architecture
     while adding ability to extract intermediate representations
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, cross_attn=0, **block_kwargs):
@@ -132,10 +122,10 @@ class FinalLayerSRA(nn.Module):
         return x
 
 
-class DiTSRA(nn.Module):
+class ReTSRA(nn.Module):
     """
-    DiT model enhanced with Self-Representation Alignment
-    Maintains all your existing functionality while adding SRA training capability
+    ReT model with Self-Representation Alignment
+    Maintains all existing functionality while adding SRA training capability
     """
     def __init__(
             self,
@@ -184,7 +174,7 @@ class DiTSRA(nn.Module):
 
         # Blocks with SRA support
         self.blocks = nn.ModuleList([
-            DiTBlockSRA(hidden_size, num_heads, mlp_ratio=mlp_ratio, cross_attn=cross_attn) 
+            ReTBlockSRA(hidden_size, num_heads, mlp_ratio=mlp_ratio, cross_attn=cross_attn) 
             for _ in range(depth)
         ])
         
@@ -216,7 +206,7 @@ class DiTSRA(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-out adaLN modulation layers in DiT blocks:
+        # Zero-out adaLN modulation layers in ReT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
@@ -362,24 +352,24 @@ def compute_sra_loss(student_repr, teacher_repr, projection_head, distance_type=
 
 # Model factory functions (maintain compatibility with your existing code)
 def LDMolSRA(**kwargs):
-    return DiTSRA(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
+    return ReTSRA(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
-def DiT_XL_2_SRA(**kwargs):
-    return DiTSRA(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def ReT_XL_2_SRA(**kwargs):
+    return ReTSRA(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
-def DiT_XL_4_SRA(**kwargs):
-    return DiTSRA(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+def ReT_XL_4_SRA(**kwargs):
+    return ReTSRA(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
-def DiT_L_2_SRA(**kwargs):
-    return DiTSRA(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+def ReT_L_2_SRA(**kwargs):
+    return ReTSRA(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
-def DiT_B_2_SRA(**kwargs):
-    return DiTSRA(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+def ReT_B_2_SRA(**kwargs):
+    return ReTSRA(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
-DiT_SRA_models = {
+ReT_SRA_models = {
     'LDMolSRA': LDMolSRA,
-    'DiT-XL/2-SRA': DiT_XL_2_SRA, 
-    'DiT-XL/4-SRA': DiT_XL_4_SRA,
-    'DiT-L/2-SRA': DiT_L_2_SRA,
-    'DiT-B/2-SRA': DiT_B_2_SRA,
+    'ReT-XL/2-SRA': ReT_XL_2_SRA, 
+    'ReT-XL/4-SRA': ReT_XL_4_SRA,
+    'ReT-L/2-SRA': ReT_L_2_SRA,
+    'ReT-B/2-SRA': ReT_B_2_SRA,
 }

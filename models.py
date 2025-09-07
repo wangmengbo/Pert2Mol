@@ -1,13 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# GLIDE: https://github.com/openai/glide-text2im
-# MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
-# --------------------------------------------------------
+# Inspired by LDMOL https://arxiv.org/pdf/2405.17829
 
 import torch
 import torch.nn as nn
@@ -147,61 +138,8 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
-# class DiTBlock(nn.Module):
-#     """
-#     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-#     """
-
-#     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, cross_attn=0, **block_kwargs):
-#         super().__init__()
-#         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-#         if cross_attn > 0:
-#             self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#             self.cross_attn = CrossAttention(hidden_size, cross_attn, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-#         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-#         approx_gelu = lambda: nn.GELU(approximate="tanh")
-#         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-#         self.factor = 9 if cross_attn > 0 else 6
-#         self.adaLN_modulation = nn.Sequential(
-#             nn.SiLU(),
-#             nn.Linear(hidden_size, hidden_size * self.factor, bias=True)
-#         )
-
-#     def forward(self, x, c, y=None, pad_mask=None):
-#         if self.factor == 9:
-#             shift_msa, scale_msa, gate_msa, shift_mca, scale_mca, gate_mca, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(self.factor, dim=1)
-#         else:
-#             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(self.factor, dim=1)
-#         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-#         if self.factor == 9:
-#             x = x + gate_mca.unsqueeze(1) * self.cross_attn(modulate(self.norm3(x), shift_mca, scale_mca), y, pad_mask)
-#         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-#         return x
-
-# class FinalLayer(nn.Module):
-#     """
-#     The final layer of DiT.
-#     """
-
-#     def __init__(self, hidden_size, patch_size, out_channels):
-#         super().__init__()
-#         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-#         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-#         self.adaLN_modulation = nn.Sequential(
-#             nn.SiLU(),
-#             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-#         )
-
-#     def forward(self, x, c):
-#         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-#         x = modulate(self.norm_final(x), shift, scale)
-#         x = self.linear(x)
-#         return x
-
-class DiTBlock(nn.Module):
-    """Replace your DiTBlock class"""
+class ReTBlock(nn.Module):
+    """Replace your ReTBlock class"""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, cross_attn=0, **block_kwargs):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -264,9 +202,9 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-class DiT(nn.Module):
+class ReT(nn.Module):
     """
-    Diffusion model with a Transformer backbone.
+    Rectified flow model with a Transformer backbone.
     """
 
     def __init__(
@@ -297,7 +235,7 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, cross_attn=cross_attn) for _ in range(depth)
+            ReTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, cross_attn=cross_attn) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -320,7 +258,7 @@ class DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-out adaLN modulation layers in DiT blocks:
+        # Zero-out adaLN modulation layers in ReT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
@@ -348,7 +286,7 @@ class DiT(nn.Module):
 
     def forward(self, x, t, y=None, pad_mask=None):
         """
-        Forward pass of DiT.
+        Forward pass of ReT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
@@ -376,7 +314,7 @@ class DiT(nn.Module):
 
     def forward_with_cfg(self, x, t, y, pad_mask, cfg_scale):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        Forward pass of ReT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
@@ -436,61 +374,61 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 def LDMol(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
+    return ReT(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
 
-def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def ReT_XL_2(**kwargs):
+    return ReT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 
-def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+def ReT_XL_4(**kwargs):
+    return ReT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 
-def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+def ReT_XL_8(**kwargs):
+    return ReT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
 
-def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+def ReT_L_2(**kwargs):
+    return ReT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
 
-def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+def ReT_L_4(**kwargs):
+    return ReT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
 
-def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+def ReT_L_8(**kwargs):
+    return ReT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 
-def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+def ReT_B_2(**kwargs):
+    return ReT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 
-def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+def ReT_B_4(**kwargs):
+    return ReT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 
-def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+def ReT_B_8(**kwargs):
+    return ReT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
 
-def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+def ReT_S_2(**kwargs):
+    return ReT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
 
-def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+def ReT_S_4(**kwargs):
+    return ReT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 
-def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+def ReT_S_8(**kwargs):
+    return ReT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
-DiT_models = {
+ReT_models = {
     'LDMol': LDMol,
-    'DiT-XL/2': DiT_XL_2, 'DiT-XL/4': DiT_XL_4, 'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2': DiT_L_2, 'DiT-L/4': DiT_L_4, 'DiT-L/8': DiT_L_8,
-    'DiT-B/2': DiT_B_2, 'DiT-B/4': DiT_B_4, 'DiT-B/8': DiT_B_8,
-    'DiT-S/2': DiT_S_2, 'DiT-S/4': DiT_S_4, 'DiT-S/8': DiT_S_8,
+    'ReT-XL/2': ReT_XL_2, 'ReT-XL/4': ReT_XL_4, 'ReT-XL/8': ReT_XL_8,
+    'ReT-L/2': ReT_L_2, 'ReT-L/4': ReT_L_4, 'ReT-L/8': ReT_L_8,
+    'ReT-B/2': ReT_B_2, 'ReT-B/4': ReT_B_4, 'ReT-B/8': ReT_B_8,
+    'ReT-S/2': ReT_S_2, 'ReT-S/4': ReT_S_4, 'ReT-S/8': ReT_S_8,
 }
