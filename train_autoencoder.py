@@ -22,7 +22,7 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-class ldmol_autoencoder(pl.LightningModule):
+class pert2mol_autoencoder(pl.LightningModule):
     def __init__(self, cp=None, config=None, loader_len=0, no_train=False, tokenizer=None, use_linear=True, use_pr=False):
         super().__init__()
         self.save_hyperparameters()
@@ -149,7 +149,7 @@ def main(args, config):
 
     # model
     print("Creating model")
-    model = ldmol_autoencoder(config=config, cp=args.enc_checkpoint, tokenizer=tokenizer, use_linear=True)
+    model = pert2mol_autoencoder(config=config, cp=args.enc_checkpoint, tokenizer=tokenizer, use_linear=True)
     print('#parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad))
 
     if args.checkpoint:

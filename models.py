@@ -373,7 +373,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
 
-def LDMol(**kwargs):
+def pert2mol(**kwargs):
     return ReT(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
 
@@ -426,7 +426,7 @@ def ReT_S_8(**kwargs):
 
 
 ReT_models = {
-    'LDMol': LDMol,
+    'pert2mol': pert2mol,
     'ReT-XL/2': ReT_XL_2, 'ReT-XL/4': ReT_XL_4, 'ReT-XL/8': ReT_XL_8,
     'ReT-L/2': ReT_L_2, 'ReT-L/4': ReT_L_4, 'ReT-L/8': ReT_L_8,
     'ReT-B/2': ReT_B_2, 'ReT-B/4': ReT_B_4, 'ReT-B/8': ReT_B_8,

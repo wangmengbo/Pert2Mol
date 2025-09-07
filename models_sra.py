@@ -351,7 +351,7 @@ def compute_sra_loss(student_repr, teacher_repr, projection_head, distance_type=
 
 
 # Model factory functions (maintain compatibility with your existing code)
-def LDMolSRA(**kwargs):
+def pert2molSRA(**kwargs):
     return ReTSRA(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
 def ReT_XL_2_SRA(**kwargs):
@@ -367,7 +367,7 @@ def ReT_B_2_SRA(**kwargs):
     return ReTSRA(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 ReT_SRA_models = {
-    'LDMolSRA': LDMolSRA,
+    'pert2molSRA': pert2molSRA,
     'ReT-XL/2-SRA': ReT_XL_2_SRA, 
     'ReT-XL/4-SRA': ReT_XL_4_SRA,
     'ReT-L/2-SRA': ReT_L_2_SRA,

@@ -28,7 +28,7 @@ import sys
 import os
 
 from models import ReT_models
-from train_autoencoder import ldmol_autoencoder
+from train_autoencoder import pert2mol_autoencoder
 from utils import AE_SMILES_encoder, regexTokenizer, dual_rna_image_encoder # molT5_encoder,
 import random
 
@@ -297,7 +297,7 @@ def main(args):
         'embed_dim': 256,
     }
     tokenizer = regexTokenizer(vocab_path='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/vocab_bpe_300_sc.txt', max_len=127)
-    ae_model = ldmol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer, use_linear=True)
+    ae_model = pert2mol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer, use_linear=True)
     
     if args.vae:
         if not use_ddp or rank == 0:
@@ -549,7 +549,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="LDMol")
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="pert2mol")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--global-batch-size", type=int, default=128) # Effective batch size (sum over all GPUs)
     parser.add_argument("--global-seed", type=int, default=0)

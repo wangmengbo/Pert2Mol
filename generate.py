@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 import json
 import pickle
-from train_autoencoder import ldmol_autoencoder
+from train_autoencoder import pert2mol_autoencoder
 from utils import AE_SMILES_decoder, regexTokenizer, dual_rna_image_encoder
 from encoders import ImageEncoder, RNAEncoder
 from dataloaders.dataset_gdp import create_raw_drug_dataloader
@@ -208,7 +208,7 @@ def main(args):
         'embed_dim': 256,
     }
     tokenizer = regexTokenizer(vocab_path='./dataloaders/vocab_bpe_300_sc.txt', max_len=127)
-    ae_model = ldmol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer, use_linear=True)
+    ae_model = pert2mol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer, use_linear=True)
     
     if args.vae:
         ae_checkpoint = torch.load(args.vae, map_location='cpu')
@@ -578,7 +578,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="LDMol")
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="pert2mol")
     parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/001-LDMol_gdp/checkpoints/0050000.pt')
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")
     
