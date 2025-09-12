@@ -35,8 +35,11 @@ from encoders import ImageEncoder, RNAEncoder
 from dataloaders.dataloader import create_raw_drug_dataloader
 from dataloaders.dataset_gdp import create_gdp_dataloaders
 from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
+from dataloaders.dataset_cpgjump import create_cpgjump_dataloaders
+from dataloaders.dataset_tahoe import create_tahoe_dataloaders
 from dataloaders.download import download_model, find_model
 from diffusion.rectified_flow import create_rectified_flow
+
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -50,6 +53,7 @@ def update_ema(ema_model, model, decay=0.9999):
         # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
+
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
@@ -57,11 +61,13 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
+
 def cleanup():
     """
     End DDP training.
     """
     dist.destroy_process_group()
+
 
 def create_logger(logging_dir):
     """
@@ -79,6 +85,7 @@ def create_logger(logging_dir):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
+
 
 def sample_with_cfg(model, flow, shape, y_full, pad_mask, 
                    cfg_scale_rna=1.0, cfg_scale_image=1.0, 
@@ -154,6 +161,7 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         x = x + dt * velocity
     
     return x
+
 
 def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_encoder, device, use_ddp, rank, args, sra_teacher_manager=None):
     """Run validation and return average losses"""
@@ -268,6 +276,7 @@ def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_e
     model.train()
     return avg_flow_loss, avg_sra_loss
 
+
 def create_dirs(args):
     os.makedirs(args.results_dir, exist_ok=True)
     # experiment_index = len(glob(f"{args.results_dir}/*"))
@@ -294,7 +303,8 @@ def main(args):
     if args.use_distributed:
         # Multi-GPU distributed training
         dist.init_process_group("nccl")
-        assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+        # assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+
         rank = dist.get_rank()
         device = rank % torch.cuda.device_count()
         seed = args.global_seed * dist.get_world_size() + rank
@@ -326,7 +336,8 @@ def main(args):
             logger = create_logger(None)
             
         use_ddp = True
-        batch_size = int(args.global_batch_size // dist.get_world_size())
+        # batch_size = int(args.global_batch_size // dist.get_world_size())
+        batch_size = args.batch_size
         
     else:
         # Single GPU training
@@ -365,7 +376,8 @@ def main(args):
         logger.info(f"Experiment directory created at {experiment_dir}")
         
         use_ddp = False
-        batch_size = args.global_batch_size
+        # batch_size = args.global_batch_size
+        batch_size = args.batch_size
     
     latent_size = 127
     in_channels = 64
@@ -451,7 +463,7 @@ def main(args):
         print(f'ImageEncoder #parameters: {sum(p.numel() for p in image_encoder.parameters())}, #trainable: {sum(p.numel() for p in image_encoder.parameters() if p.requires_grad)}')
 
     # Setup rna encoder (unchanged)
-    rna_encoder = RNAEncoder(input_dim=gene_count_matrix.shape[0],output_dim=64,dropout=0.1).to(device)
+    rna_encoder = RNAEncoder(input_dim=gene_count_matrix.shape[0], output_dim=64, dropout=0.1).to(device)
     if use_ddp:
         rna_encoder = DDP(rna_encoder, device_ids=[rank], find_unused_parameters=True)
     for param in rna_encoder.parameters():
@@ -484,6 +496,10 @@ def main(args):
             num_workers=args.num_workers,
             compound_name_label=args.compound_name_label,
             debug_mode=args.debug_mode,
+            debug_samples=args.debug_samples,
+            debug_cell_lines=args.debug_cell_lines,
+            debug_drugs=args.debug_drugs,
+            seed=args.seed,
             split_train_test=True,
             return_datasets=True,
         )
@@ -528,6 +544,10 @@ def main(args):
             num_workers=args.num_workers,
             compound_name_label=args.compound_name_label,
             debug_mode=args.debug_mode,
+            debug_samples=args.debug_samples,
+            debug_cell_lines=args.debug_cell_lines,
+            debug_drugs=args.debug_drugs,
+            seed=args.seed,
             split_train_test=True,
         )
 
@@ -784,7 +804,9 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="")
     parser.add_argument("--model", type=str, choices=list(ReT_SRA_models.keys()), default="pert2molSRA")
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--global-batch-size", type=int, default=128) # Effective batch size (sum over all GPUs)
+    # parser.add_argument("--global-batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for data shuffling") 
     parser.add_argument("--global-seed", type=int, default=42)
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=16)
@@ -792,16 +814,20 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--use-distributed", action="store_true", help="Enable distributed training across multiple GPUs")
     parser.add_argument("--prefix", type=str, default=None)
-    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "other"], default="gdp")
-    parser.add_argument("--image-json-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json")
-    parser.add_argument("--drug-data-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl")
-    parser.add_argument("--raw-drug-csv-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv")
-    parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
-    parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
-    parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
+    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "cpgjump", "tahoe", "other"], default="gdp")
+    parser.add_argument("--image-json-path", type=str, default=None)
+    parser.add_argument("--drug-data-path", type=str, default=None)
+    parser.add_argument("--raw-drug-csv-path", type=str, default=None)
+    parser.add_argument("--metadata-control-path", type=str, default=None)
+    parser.add_argument("--metadata-drug-path", type=str, default=None)
+    parser.add_argument("--gene-count-matrix-path", type=str, default=None)
     parser.add_argument("--compound-name-label", type=str, default="compound")
     parser.add_argument("--transpose-gene-count-matrix", action='store_true', default=False)
+    
     parser.add_argument("--debug-mode", action='store_true', default=False)
+    parser.add_argument("--debug-samples", type=int, default=2000, help="When in debug mode, use this many samples")
+    parser.add_argument("--debug-cell-lines", type=str, nargs='+', default=None, help="When in debug mode, use only these cell lines")
+    parser.add_argument("--debug-drugs", type=str, nargs='+', default=None, help="When in debug mode, use only these drugs")
 
     # Add these SRA-related arguments after your existing arguments
     parser.add_argument("--use-sra", action="store_true", default=True, help="Enable Self-Representation Alignment")
@@ -815,13 +841,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     print(args)
-
-    gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
+    
+    if args.gene_count_matrix_path is not None:
+        gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
 
     if args.dataset == "gdp":
         create_data_loader = create_gdp_dataloaders
     elif args.dataset == "lincs_rna":
         create_data_loader = create_lincs_rna_dataloaders
+        gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "cpgjump":
+        create_data_loader = create_cpgjump_dataloaders
+    elif args.dataset == "tahoe":
+        create_data_loader = create_tahoe_dataloaders
         gene_count_matrix = gene_count_matrix.T
     elif args.dataset == "other":
         for i in ["image_json_path", "gene_count_matrix_path"]:

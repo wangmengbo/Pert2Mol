@@ -79,7 +79,7 @@ def image_transform(images):
     Returns:
         Normalized and contrast-enhanced images
     """
-    # Normalize 16-bit to 0-1 range (CORRECTED from /255 to /65535)
+    # Normalize 16-bit to 0-1 range
     images_norm = (images / 32767.5) - 1.0
     # Apply per-channel contrast enhancement
     enhanced_images = np.zeros_like(images_norm)
@@ -120,8 +120,7 @@ def create_dataloader(
 
     fallback_smiles_dict: Optional[Dict[str, str]] = None,
     enable_smiles_fallback: bool = False,
-    **kwargs
-) -> DataLoader:
+    **kwargs) -> DataLoader:
     """
     Create DataLoader with drug conditioning and debug options.
     
@@ -252,15 +251,18 @@ def create_dataloader(
 def create_raw_drug_dataloader(
     metadata_control: pd.DataFrame,
     metadata_drug: pd.DataFrame,
-    drug_data_path: str,
-    raw_drug_csv_path: str,
+    drug_data_path: str = None,
+    raw_drug_csv_path: str = None,
     image_json_path: str = None,
     gene_count_matrix: pd.DataFrame = None,
-    compound_name_label='compound',
+    cell_type_label: str = 'cell_line',
+    extra_labels_to_match: Optional[List[str]] = None,
+    compound_name_label: str = 'compound',
+    smiles_label: str = 'canonical_smiles',
     batch_size: int = 4,
     shuffle: bool = True,
     num_workers: int = 0,
-    transform=None,
+    transform: Optional[Callable] = None,
     target_size: int = 256,
     use_highly_variable_genes: bool = True,
     n_top_genes: int = 2000,
@@ -273,8 +275,9 @@ def create_raw_drug_dataloader(
     smiles_cache: Optional[Dict] = None,
     split_train_test: bool = True,
     test_size: float = 0.2,
-    **kwargs
-):
+    **kwargs):
+    logger.info(f"extra_labels_to_match={extra_labels_to_match}")
+
     """Create DataLoader for raw drug CSV data with biological conditioning"""
     # Load image paths
     if image_json_path is not None and os.path.exists(image_json_path):
@@ -293,6 +296,9 @@ def create_raw_drug_dataloader(
         drug_data_path=drug_data_path,
         raw_drug_csv_path=raw_drug_csv_path,
         compound_name_label=compound_name_label,
+        smiles_label=smiles_label,
+        cell_type_label=cell_type_label,
+        extra_labels_to_match=extra_labels_to_match,
         transform=transform or image_transform,
         target_size=target_size,
         smiles_cache=smiles_cache,
@@ -360,7 +366,7 @@ def create_raw_drug_dataloader(
             collated['drug_condition'] = torch.stack(padded_conditions)
         
         return collated
-    
+        
     # Adjust for debug mode
     if debug_mode:
         batch_size = min(batch_size, 4)
@@ -518,14 +524,14 @@ def _create_modality_combinations(rna_df, imaging_df, compound_name_label='compo
 
 def create_leak_free_dataloaders(
     metadata_control: pd.DataFrame,
-    metadata_rna: pd.DataFrame,  # RNA-seq treatment data (GDPx1x2)
-    metadata_imaging: pd.DataFrame,  # Imaging treatment data (GDPx3)
-    shared_drugs: List[str],
-    shared_cell_lines: List[str],
-    gene_count_matrix: pd.DataFrame,
-    image_json_path: str,
     drug_data_path: str,
     raw_drug_csv_path: str,
+    metadata_rna: Optional[pd.DataFrame] = None,
+    metadata_imaging: Optional[pd.DataFrame] = None,
+    shared_drugs: Optional[List[str]] = None,
+    shared_cell_lines: Optional[List[str]] = None,
+    gene_count_matrix: Optional[pd.DataFrame] = None,
+    image_json_path: Optional[str] = None,
     use_highly_variable_genes: bool = True,
     n_top_genes: int = 2000,
     normalize: bool = True,
@@ -538,14 +544,16 @@ def create_leak_free_dataloaders(
     num_workers: int = 0,
     stratify_by: Optional[List[str]] = None,
     compound_name_label: str = 'compound',
+    cell_type_label: str = 'cell_line',
+    extra_labels_to_match: Optional[List[str]] = None,
+    smiles_label: str = 'canonical_smiles',
     create_modality_combinations=_create_modality_combinations,
     prepare_metadata_for_dataset=_prepare_metadata_for_dataset,
     debug_mode: bool = False,
     debug_samples: int = 50,
     debug_cell_lines: Optional[List[str]] = None,
     debug_drugs: Optional[List[str]] = None,
-    **dataloader_kwargs
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    **dataloader_kwargs) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Create leak-free train/test dataloaders with balanced combination ratios.
     
@@ -553,32 +561,75 @@ def create_leak_free_dataloaders(
         final_train_test_ratio: Desired ratio of train:test combinations (default 4.0 for 80:20)
         test_size: Deprecated - ratio is computed automatically for balanced splits
     """
-    
-    # Calculate optimal per-modality split ratios
-    R = final_train_test_ratio
-    optimal_train_fraction = np.sqrt(R) / (1 + np.sqrt(R))
-    computed_test_size = 1 - optimal_train_fraction
-    
-    logger.info(f"Target train:test combination ratio: {R}:1")
-    logger.info(f"Computed per-modality train fraction: {optimal_train_fraction:.3f}")
-    logger.info(f"Computed per-modality test fraction: {computed_test_size:.3f}")
-    
-    if test_size is not None:
-        logger.warning(f"Ignoring provided test_size={test_size}. Using computed test_size={computed_test_size:.3f} for balanced splits.")
-    
+    # # print all arguments passed to the function
+    # print("Arguments passed to create_cpgjump_dataloaders:")
+    # for arg, value in locals().items():
+    #     print(f"{arg}: {value}")
+   
+    has_rna = metadata_rna is not None and not metadata_rna.empty
+    has_imaging = metadata_imaging is not None and not metadata_imaging.empty
+    if not has_rna and not has_imaging:
+        raise ValueError("At least one modality (RNA or imaging) must be provided")
+
+    if has_rna and has_imaging:
+        # Calculate optimal per-modality split ratios
+        optimal_train_fraction = np.sqrt(final_train_test_ratio) / (1 + np.sqrt(final_train_test_ratio))
+        computed_test_size = 1 - optimal_train_fraction
+        
+        logger.info(f"Target train:test combination ratio: {final_train_test_ratio}:1")
+        logger.info(f"Computed per-modality train fraction: {optimal_train_fraction:.3f}")
+        logger.info(f"Computed per-modality test fraction: {computed_test_size:.3f}")
+        
+        if test_size is not None:
+            logger.warning(f"Ignoring provided test_size={test_size}. Using computed test_size={computed_test_size:.3f} for balanced splits.")
+    else:
+        computed_test_size = 1. / (final_train_test_ratio + 1)
+
+    single_modality = has_rna ^ has_imaging  # XOR - exactly one is True
+    logger.info(f"Mode: {'Single' if single_modality else 'Dual'} modality")
+    if single_modality:
+        modality_type = "RNA" if has_rna else "Imaging"
+        logger.info(f"Single modality type: {modality_type}")
+
     # Filter to shared conditions
-    rna_filtered = metadata_rna[
-        (metadata_rna[compound_name_label].isin(shared_drugs)) &
-        (metadata_rna['cell_line'].isin(shared_cell_lines))
-    ].reset_index(drop=True)
-    
-    imaging_filtered = metadata_imaging[
-        (metadata_imaging[compound_name_label].isin(shared_drugs)) &
-        (metadata_imaging['cell_line'].isin(shared_cell_lines))
-    ].reset_index(drop=True)
-    
-    logger.info(f"Filtered RNA samples: {len(rna_filtered)}")
-    logger.info(f"Filtered imaging samples: {len(imaging_filtered)}")
+    rna_filtered = pd.DataFrame()
+    imaging_filtered = pd.DataFrame()
+
+    if shared_drugs is None or len(shared_drugs) == 0:
+        if has_rna and not has_imaging:
+            shared_drugs = metadata_rna[compound_name_label].unique().tolist()
+        elif has_imaging and not has_rna:
+            shared_drugs = metadata_imaging[compound_name_label].unique().tolist()
+        elif has_rna and has_imaging:
+            drugs_rna = set(metadata_rna[compound_name_label].unique())
+            drugs_imaging = set(metadata_imaging[compound_name_label].unique())
+            shared_drugs = list(drugs_rna.intersection(drugs_imaging))
+        logger.info(f"No shared_drugs provided - using all available drugs ({len(shared_drugs)})")
+
+    if shared_cell_lines is None or len(shared_cell_lines) == 0:
+        if has_rna and not has_imaging:
+            shared_cell_lines = metadata_rna[cell_type_label].unique().tolist()
+        elif has_imaging and not has_rna:
+            shared_cell_lines = metadata_imaging[cell_type_label].unique().tolist()
+        elif has_rna and has_imaging:
+            cls_rna = set(metadata_rna[cell_type_label].unique())
+            cls_imaging = set(metadata_imaging[cell_type_label].unique())
+            shared_cell_lines = list(cls_rna.intersection(cls_imaging))
+        logger.info(f"No shared_cell_lines provided - using all available cell lines ({len(shared_cell_lines)})")
+
+    if has_rna:
+        rna_filtered = metadata_rna[
+            (metadata_rna[compound_name_label].isin(shared_drugs)) &
+            (metadata_rna[cell_type_label].isin(shared_cell_lines))
+        ].reset_index(drop=True)
+        logger.info(f"Filtered RNA samples: {len(rna_filtered)}")
+
+    if has_imaging:
+        imaging_filtered = metadata_imaging[
+            (metadata_imaging[compound_name_label].isin(shared_drugs)) &
+            (metadata_imaging[cell_type_label].isin(shared_cell_lines))
+        ].reset_index(drop=True)
+        logger.info(f"Filtered imaging samples: {len(imaging_filtered)}")
     
     # Create stratification groups if specified
     def create_strata_labels(df, stratify_columns):
@@ -588,135 +639,176 @@ def create_leak_free_dataloaders(
         return strata
     
     # Split RNA-seq treatment data using computed ratios
-    unique_rna_samples = rna_filtered['sample_id'].unique()
-    logger.info(f"Found {len(unique_rna_samples)} unique RNA sample IDs")
-    
-    if len(unique_rna_samples) > 1:
-        try:
-            if stratify_by is not None:
-                rna_sample_info = rna_filtered.groupby('sample_id').first()
-                rna_strata = create_strata_labels(rna_sample_info.loc[unique_rna_samples], stratify_by)
-            else:
-                rna_strata = None
-            
-            rna_train_ids, rna_test_ids = train_test_split(
-                unique_rna_samples,
-                test_size=computed_test_size,
-                random_state=random_state,
-                stratify=rna_strata
-            )
-        except ValueError as e:
-            logger.warning(f"Stratified split failed for RNA samples: {e}. Using random split.")
-            rna_train_ids, rna_test_ids = train_test_split(
-                unique_rna_samples,
-                test_size=computed_test_size,
-                random_state=random_state
-            )
+    rna_train = pd.DataFrame()
+    rna_test = pd.DataFrame()
+
+    if has_rna:
+        unique_rna_samples = rna_filtered['sample_id'].unique()
+        logger.info(f"Found {len(unique_rna_samples)} unique RNA sample IDs")
         
-        rna_train = rna_filtered[rna_filtered['sample_id'].isin(rna_train_ids)].reset_index(drop=True)
-        rna_test = rna_filtered[rna_filtered['sample_id'].isin(rna_test_ids)].reset_index(drop=True)
-    else:
-        rna_train = rna_filtered
-        rna_test = pd.DataFrame(columns=rna_filtered.columns)
+        if len(unique_rna_samples) > 1:
+            try:
+                if stratify_by is not None:
+                    rna_sample_info = rna_filtered.groupby('sample_id').first()
+                    rna_strata = create_strata_labels(rna_sample_info.loc[unique_rna_samples], stratify_by)
+                else:
+                    rna_strata = None
+                
+                rna_train_ids, rna_test_ids = train_test_split(
+                    unique_rna_samples,
+                    test_size=computed_test_size,
+                    random_state=random_state,
+                    stratify=rna_strata
+                )
+            except ValueError as e:
+                logger.warning(f"Stratified split failed for RNA samples: {e}. Using random split.")
+                rna_train_ids, rna_test_ids = train_test_split(
+                    unique_rna_samples,
+                    test_size=computed_test_size,
+                    random_state=random_state
+                )
+            
+            rna_train = rna_filtered[rna_filtered['sample_id'].isin(rna_train_ids)].reset_index(drop=True)
+            rna_test = rna_filtered[rna_filtered['sample_id'].isin(rna_test_ids)].reset_index(drop=True)
+        else:
+            rna_train = rna_filtered
+            rna_test = pd.DataFrame(columns=rna_filtered.columns)
     
     # Split imaging treatment data using same computed ratios
-    unique_imaging_samples = imaging_filtered['json_key'].unique()
-    logger.info(f"Found {len(unique_imaging_samples)} unique imaging sample IDs")
-    
-    if len(unique_imaging_samples) > 1:
-        try:
-            if stratify_by is not None:
-                imaging_sample_info = imaging_filtered.groupby('json_key').first()
-                imaging_strata = create_strata_labels(imaging_sample_info.loc[unique_imaging_samples], stratify_by)
-            else:
-                imaging_strata = None
-            
-            imaging_train_ids, imaging_test_ids = train_test_split(
-                unique_imaging_samples,
-                test_size=computed_test_size,
-                random_state=random_state,
-                stratify=imaging_strata
-            )
-        except ValueError as e:
-            logger.warning(f"Stratified split failed for imaging samples: {e}. Using random split.")
-            imaging_train_ids, imaging_test_ids = train_test_split(
-                unique_imaging_samples,
-                test_size=computed_test_size,
-                random_state=random_state
-            )
+    imaging_train = pd.DataFrame()
+    imaging_test = pd.DataFrame()
+
+    if has_imaging:
+        unique_imaging_samples = imaging_filtered['json_key'].unique()
+        logger.info(f"Found {len(unique_imaging_samples)} unique imaging sample IDs")
         
-        imaging_train = imaging_filtered[imaging_filtered['json_key'].isin(imaging_train_ids)].reset_index(drop=True)
-        imaging_test = imaging_filtered[imaging_filtered['json_key'].isin(imaging_test_ids)].reset_index(drop=True)
-    else:
-        imaging_train = imaging_filtered
-        imaging_test = pd.DataFrame(columns=imaging_filtered.columns)
+        if len(unique_imaging_samples) > 1:
+            try:
+                if stratify_by is not None:
+                    imaging_sample_info = imaging_filtered.groupby('json_key').first()
+                    imaging_strata = create_strata_labels(imaging_sample_info.loc[unique_imaging_samples], stratify_by)
+                else:
+                    imaging_strata = None
+                
+                imaging_train_ids, imaging_test_ids = train_test_split(
+                    unique_imaging_samples,
+                    test_size=computed_test_size,
+                    random_state=random_state,
+                    stratify=imaging_strata
+                )
+            except ValueError as e:
+                logger.warning(f"Stratified split failed for imaging samples: {e}. Using random split.")
+                imaging_train_ids, imaging_test_ids = train_test_split(
+                    unique_imaging_samples,
+                    test_size=computed_test_size,
+                    random_state=random_state
+                )
+            
+            imaging_train = imaging_filtered[imaging_filtered['json_key'].isin(imaging_train_ids)].reset_index(drop=True)
+            imaging_test = imaging_filtered[imaging_filtered['json_key'].isin(imaging_test_ids)].reset_index(drop=True)
+        else:
+            imaging_train = imaging_filtered
+            imaging_test = pd.DataFrame(columns=imaging_filtered.columns)
     
     # Log split results with predicted combination counts
-    rna_train_count = len(rna_train['sample_id'].unique())
-    rna_test_count = len(rna_test['sample_id'].unique())
-    imaging_train_count = len(imaging_train['json_key'].unique())
-    imaging_test_count = len(imaging_test['json_key'].unique())
-    
-    logger.info(f"RNA train: {len(rna_train)} rows, {rna_train_count} unique samples")
-    logger.info(f"RNA test: {len(rna_test)} rows, {rna_test_count} unique samples")
-    logger.info(f"Imaging train: {len(imaging_train)} rows, {imaging_train_count} unique samples")
-    logger.info(f"Imaging test: {len(imaging_test)} rows, {imaging_test_count} unique samples")
-    
-    # Estimate combination counts (rough approximation)
-    est_train_combinations = len(rna_train) * len(imaging_train) / 100  # Rough estimate
-    est_test_combinations = len(rna_test) * len(imaging_test) / 100    # Rough estimate
-    if est_test_combinations > 0:
-        est_ratio = est_train_combinations / est_test_combinations
-        logger.info(f"Estimated train combinations: ~{est_train_combinations:.0f}")
-        logger.info(f"Estimated test combinations: ~{est_test_combinations:.0f}")
-        logger.info(f"Estimated train:test ratio: ~{est_ratio:.1f}:1 (target: {R}:1)")
+    if has_rna:
+        rna_train_count = len(rna_train['sample_id'].unique())
+        rna_test_count = len(rna_test['sample_id'].unique())
+        logger.info(f"RNA train: {len(rna_train)} rows, {rna_train_count} unique samples")
+        logger.info(f"RNA test: {len(rna_test)} rows, {rna_test_count} unique samples")
+
+    if has_imaging:
+        imaging_train_count = len(imaging_train['json_key'].unique())
+        imaging_test_count = len(imaging_test['json_key'].unique())
+        logger.info(f"Imaging train: {len(imaging_train)} rows, {imaging_train_count} unique samples")
+        logger.info(f"Imaging test: {len(imaging_test)} rows, {imaging_test_count} unique samples")
+
+    # Estimate combination counts (only for dual modality)
+    if not single_modality:
+        est_train_combinations = len(rna_train) * len(imaging_train) / 100  # Rough estimate
+        est_test_combinations = len(rna_test) * len(imaging_test) / 100    # Rough estimate
+        if est_test_combinations > 0:
+            est_ratio = est_train_combinations / est_test_combinations
+            logger.info(f"Estimated train combinations: ~{est_train_combinations:.0f}")
+            logger.info(f"Estimated test combinations: ~{est_test_combinations:.0f}")
+            logger.info(f"Estimated train:test ratio: ~{est_ratio:.1f}:1 (target: {final_train_test_ratio}:1)")
     
     # Verify no overlap in unique sample IDs
-    rna_train_unique = set(rna_train['sample_id'].unique())
-    rna_test_unique = set(rna_test['sample_id'].unique())
-    imaging_train_unique = set(imaging_train['json_key'].unique())
-    imaging_test_unique = set(imaging_test['json_key'].unique())
-    
-    rna_split_overlap = rna_train_unique.intersection(rna_test_unique)
-    imaging_split_overlap = imaging_train_unique.intersection(imaging_test_unique)
-    
-    if rna_split_overlap:
-        logger.error(f"❌ RNA split overlap: {len(rna_split_overlap)} samples in both splits")
-        raise ValueError("RNA sample leakage detected!")
-    
-    if imaging_split_overlap:
-        logger.error(f"❌ Imaging split overlap: {len(imaging_split_overlap)} samples in both splits")
-        raise ValueError("Imaging sample leakage detected!")
-    
+    if has_rna:
+        rna_train_unique = set(rna_train['sample_id'].unique())
+        rna_test_unique = set(rna_test['sample_id'].unique())
+        rna_split_overlap = rna_train_unique.intersection(rna_test_unique)
+        if rna_split_overlap:
+            logger.error(f"❌ RNA split overlap: {len(rna_split_overlap)} samples in both splits")
+            raise ValueError("RNA sample leakage detected!")
+
+    if has_imaging:
+        imaging_train_unique = set(imaging_train['json_key'].unique())
+        imaging_test_unique = set(imaging_test['json_key'].unique())
+        imaging_split_overlap = imaging_train_unique.intersection(imaging_test_unique)
+        if imaging_split_overlap:
+            logger.error(f"❌ Imaging split overlap: {len(imaging_split_overlap)} samples in both splits")
+            raise ValueError("Imaging sample leakage detected!")
+
     logger.info("✓ No overlap in individual modality splits")
     
     # Create train and test combinations
-    train_combinations = create_modality_combinations(rna_train, imaging_train, shared_cell_lines, "train")
-    test_combinations = create_modality_combinations(rna_test, imaging_test, shared_cell_lines, "test")
+    if single_modality:
+        if has_rna:
+            train_combinations = rna_train.copy()
+            test_combinations = rna_test.copy()
+            logger.info("Using RNA data directly for single modality")
+        else:
+            train_combinations = imaging_train.copy()  
+            test_combinations = imaging_test.copy()
+            logger.info("Using imaging data directly for single modality")
+    else:
+        train_combinations = create_modality_combinations(rna_train, imaging_train, shared_cell_lines, "train")
+        test_combinations = create_modality_combinations(rna_test, imaging_test, shared_cell_lines, "test")
+        logger.info("Created cross-modal combinations for dual modality")
     logger.info(f"Final train combinations: {len(train_combinations)}")
     logger.info(f"Final test combinations: {len(test_combinations)}")
 
     # Verify final train:test ratio
     if not train_combinations.empty and not test_combinations.empty:
         actual_ratio = len(train_combinations) / len(test_combinations)
-        logger.info(f"Actual train:test combination ratio: {actual_ratio:.2f}:1 (target: {R}:1)")
+        logger.info(f"Actual train:test combination ratio: {actual_ratio:.2f}:1 (target: {final_train_test_ratio}:1)")
         
         # Check for sample leakage in final combinations
-        train_rna_ids = set(train_combinations['sample_id:rna'].astype(str))
-        test_rna_ids = set(test_combinations['sample_id:rna'].astype(str))
-        train_imaging_ids = set(train_combinations['json_key:hist'].astype(str))
-        test_imaging_ids = set(test_combinations['json_key:hist'].astype(str))
-        
-        rna_overlap = train_rna_ids.intersection(test_rna_ids)
-        imaging_overlap = train_imaging_ids.intersection(test_imaging_ids)
-        
-        if rna_overlap or imaging_overlap:
-            logger.error(f"Final combination leakage - RNA: {len(rna_overlap)}, Imaging: {len(imaging_overlap)}")
+        if single_modality:
+            if has_rna:
+                train_unique = set(train_combinations['sample_id'].unique())
+                test_unique = set(test_combinations['sample_id'].unique())
+                overlap = train_unique.intersection(test_unique)
+                if overlap:
+                    logger.error(f"❌ RNA single modality overlap: {len(overlap)} samples")
+                    raise ValueError("RNA sample leakage detected!")
+            else:
+                train_unique = set(train_combinations['json_key'].unique())
+                test_unique = set(test_combinations['json_key'].unique()) 
+                overlap = train_unique.intersection(test_unique)
+                if overlap:
+                    logger.error(f"❌ Imaging single modality overlap: {len(overlap)} samples")
+                    raise ValueError("Imaging sample leakage detected!")
+            logger.info("✓ No overlap in single modality split")
         else:
-            logger.info("✓ No sample leakage in final combinations")
+            # Dual modality leakage check
+            train_rna_ids = set(train_combinations['sample_id:rna'].astype(str))
+            test_rna_ids = set(test_combinations['sample_id:rna'].astype(str))
+            train_imaging_ids = set(train_combinations['json_key:hist'].astype(str))
+            test_imaging_ids = set(test_combinations['json_key:hist'].astype(str))
+            
+            rna_overlap = train_rna_ids.intersection(test_rna_ids)
+            imaging_overlap = train_imaging_ids.intersection(test_imaging_ids)
+            
+            if rna_overlap or imaging_overlap:
+                logger.error(f"Final combination leakage - RNA: {len(rna_overlap)}, Imaging: {len(imaging_overlap)}")
+                raise ValueError("Sample leakage detected in final combinations!")
+            else:
+                logger.info("✓ No sample leakage in final combinations")
     
     # Process gene matrix if needed
-    if use_highly_variable_genes:
+    if use_highly_variable_genes and gene_count_matrix is not None and has_rna:
         logger.info("Selecting highly variable genes before creating dataloaders")
         logger.info(f"Original gene_count_matrix shape: {gene_count_matrix.shape}")
         adata = ad.AnnData(
@@ -751,8 +843,11 @@ def create_leak_free_dataloaders(
             image_json_path=image_json_path,
             drug_data_path=drug_data_path,
             raw_drug_csv_path=raw_drug_csv_path,
-            use_highly_variable_genes=False,  # Already processed
+            use_highly_variable_genes=False,
+            cell_type_label=cell_type_label,
+            extra_labels_to_match=extra_labels_to_match,
             compound_name_label=compound_name_label,
+            smiles_label=smiles_label,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
@@ -775,8 +870,11 @@ def create_leak_free_dataloaders(
             image_json_path=image_json_path,
             drug_data_path=drug_data_path,
             raw_drug_csv_path=raw_drug_csv_path,
-            use_highly_variable_genes=False,  # Already processed
+            use_highly_variable_genes=False,
+            cell_type_label=cell_type_label,
+            extra_labels_to_match=extra_labels_to_match,
             compound_name_label=compound_name_label,
+            smiles_label=smiles_label,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,

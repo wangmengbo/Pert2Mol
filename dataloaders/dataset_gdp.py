@@ -143,6 +143,7 @@ def prepare_metadata_for_dataset(combined_df, compound_name_label='compound'):
     
     return metadata_drug
 
+
 def create_gdp_dataloaders(metadata_control: pd.DataFrame=None,
     metadata_drug: pd.DataFrame=None,
     drug_data_path: str=None,
@@ -225,15 +226,15 @@ def create_gdp_dataloaders(metadata_control: pd.DataFrame=None,
 
     # Create leak-free train/test dataloaders
     train_loader, test_loader = create_leak_free_dataloaders(
-        metadata_control=metadata_control,
+        metadata_control,
+        DRUG_DATA_PATH,
+        RAW_DRUG_CSV_PATH,
         metadata_rna=gdpx1x2_metadata[gdpx1x2_metadata['compound'] != 'DMSO'],
         metadata_imaging=gdpx3_metadata[gdpx3_metadata['compound'] != 'DMSO'],
         shared_drugs=shared_drugs,
         shared_cell_lines=shared_cell_lines,
         gene_count_matrix=gene_count_matrix,
         image_json_path=IMAGE_JSON_PATH,
-        drug_data_path=DRUG_DATA_PATH,
-        raw_drug_csv_path=RAW_DRUG_CSV_PATH,
         # test_size=test_size,
         final_train_test_ratio = (1-test_size)/test_size,
         batch_size=batch_size,

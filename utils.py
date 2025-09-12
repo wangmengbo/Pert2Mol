@@ -126,6 +126,7 @@ def AE_SMILES_decoder(pv, model, stochastic=False, k=2, max_length=150):
             # candidate.append(random.choice(candidate_k))
     return candidate
 
+
 def dual_rna_image_encoder(control_images, treatment_images, control_rna, treatment_rna, 
                           image_encoder, rna_encoder, device):
     """
@@ -147,6 +148,7 @@ def dual_rna_image_encoder(control_images, treatment_images, control_rna, treatm
     attention_mask = torch.ones(combined_features.size(0), 2, dtype=torch.bool, device=device)
     
     return combined_features, attention_mask
+
 
 def get_validity(smiles):
     from rdkit import Chem
@@ -275,7 +277,6 @@ class regexTokenizer():
             res = res[:self.max_len]
             # res[-1] = self.sep_token_id
         return token_length, torch.LongTensor([res])
-
 
 
 def standardize_smiles_single(smiles_data):

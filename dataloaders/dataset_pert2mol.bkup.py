@@ -29,10 +29,10 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dataloaders.utils import convert_to_aromatic_smiles, scale_down_images, load_drug_data_hdf5
+from .utils import convert_to_aromatic_smiles, scale_down_images, load_drug_data_hdf5
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -50,8 +50,6 @@ class HistologyTranscriptomicsDataset(Dataset):
                  transform: Optional[Callable] = None,
                  target_size: Optional[int] = None,
                  cell_type_label: str = 'cell_line',
-                 extra_labels_to_match: Optional[List[str]] = [],
-                 default_transcriptomics_size: Optional[int] = 128,
                  ):
         """
         Args:
@@ -70,25 +68,11 @@ class HistologyTranscriptomicsDataset(Dataset):
         self.transform = transform
         self.target_size = target_size
         self.cell_type_label = cell_type_label
-        self.extra_labels_to_match = extra_labels_to_match
-        print(f"extra_labels_to_match={extra_labels_to_match}")
-        print(f"self.extra_labels_to_match={self.extra_labels_to_match}")
 
         logger.debug(f"self.metadata_drug.columns={self.metadata_drug.columns.tolist()}")
 
-        # Auto-detect transcriptomics size or use provided/default value
-        if default_transcriptomics_size is not None:
-            self.transcriptomics_size = default_transcriptomics_size
-            logger.info(f"Using provided transcriptomics size: {self.transcriptomics_size}")
-        elif gene_count_matrix is not None:
-            self.transcriptomics_size = gene_count_matrix.shape[0]  # Number of genes
-            logger.info(f"Auto-detected transcriptomics size from gene matrix: {self.transcriptomics_size}")
-        else:
-            self.transcriptomics_size = 2000  # Reasonable default for most genomics datasets
-            logger.info(f"Using default transcriptomics size: {self.transcriptomics_size}")
-
         # Convert relevant columns to appropriate types
-        for k in ['sample_id', self.cell_type_label, 'json_key', 'compound'] + self.extra_labels_to_match:
+        for k in ['sample_id', self.cell_type_label, 'json_key', 'compound']:
             if k in self.metadata_control.columns:
                 self.metadata_control[k] = self.metadata_control[k].astype(str)
             if k in self.metadata_drug.columns:
@@ -96,167 +80,79 @@ class HistologyTranscriptomicsDataset(Dataset):
         
         for k in ['timepoint', 'compound_concentration_in_uM']:
             if k in self.metadata_control.columns:
-                self.metadata_control[k] = self.metadata_control[k].astype(float).astype(str)
+                self.metadata_control[k] = self.metadata_control[k].astype(float)
             if k in self.metadata_drug.columns:
-                self.metadata_drug[k] = self.metadata_drug[k].astype(float).astype(str)
+                self.metadata_drug[k] = self.metadata_drug[k].astype(float)
 
         # Group control metadata by cell_line for efficient sampling
         self.control_grouped = self.metadata_control.groupby(self.cell_type_label)
         
-        # # Get available cell lines in both datasets
-        # control_cell_lines = set(self.metadata_control[self.cell_type_label].unique())
-        # drug_cell_lines = set(self.metadata_drug[self.cell_type_label].unique())
-        # self.common_cell_lines = control_cell_lines.intersection(drug_cell_lines)
-        # logger.info(f"Found {len(self.common_cell_lines)} common cell lines between control and drug datasets")
-        # logger.info(f"#Control cell lines={len(control_cell_lines)} ({control_cell_lines}); #Drug cell lines={len(drug_cell_lines)} ({drug_cell_lines})")
+        # Get available cell lines in both datasets
+        control_cell_lines = set(self.metadata_control[self.cell_type_label].unique())
+        drug_cell_lines = set(self.metadata_drug[self.cell_type_label].unique())
+        self.common_cell_lines = control_cell_lines.intersection(drug_cell_lines)
+        logger.info(f"Found {len(self.common_cell_lines)} common cell lines between control and drug datasets")
+        logger.info(f"#Control cell lines={len(control_cell_lines)} ({control_cell_lines}); #Drug cell lines={len(drug_cell_lines)} ({drug_cell_lines})")
         
-        # # Filter drug metadata to only include samples with matching control cell lines
-        # self.filtered_drug_metadata = self.metadata_drug[
-        #     self.metadata_drug[cell_type_label].isin(self.common_cell_lines)
-        # ].reset_index(drop=True)
+        # Filter drug metadata to only include samples with matching control cell lines
+        self.filtered_drug_metadata = self.metadata_drug[
+            self.metadata_drug[cell_type_label].isin(self.common_cell_lines)
+        ].reset_index(drop=True)
         
-        # Group control metadata by cell_line + extra matching labels for efficient sampling
-        grouping_columns = [self.cell_type_label] + self.extra_labels_to_match
-        logger.info(f"grouping_columns={grouping_columns}")
-
-        self.control_grouped = self.metadata_control.groupby(grouping_columns)
-
-        # Get available combinations in both datasets
-        control_combinations = set(self.metadata_control[grouping_columns].apply(tuple, axis=1))
-        drug_combinations = set(self.metadata_drug[grouping_columns].apply(tuple, axis=1))
-        self.common_combinations = control_combinations.intersection(drug_combinations)
-        logger.info(f"Found {len(self.common_combinations)} common combinations between control and drug datasets")
-        logger.info(f"Grouping by columns: {grouping_columns}")
-
-        # Filter drug metadata to only include samples with matching control combinations
-        combination_mask = self.metadata_drug[grouping_columns].apply(tuple, axis=1).isin(self.common_combinations)
-        self.filtered_drug_metadata = self.metadata_drug[combination_mask].reset_index(drop=True)
-
         # Pre-sample control samples for each treatment sample to ensure reproducibility
         self._create_control_treatment_mapping()
         
         logger.info(f"Dataset initialized with {len(self.filtered_drug_metadata)} treatment samples")
-        logger.info(f"#Common combinations: {len(self.common_combinations)}")
+        logger.info(f"#Common cell lines: {len(self.common_cell_lines)}")
         logger.info(f"Pre-sampled {len(self.control_sample_mapping)} control-treatment pairs")
     
-    # def _create_control_treatment_mapping(self):
-    #     """
-    #     Pre-sample control samples for each treatment sample to ensure proper randomization
-    #     and reproducibility. Uses vectorized sampling to avoid sequential sampling bias.
-    #     """
-    #     self.control_sample_mapping = {}
-        
-    #     # Group treatment samples by cell line
-    #     treatment_grouped = self.filtered_drug_metadata.groupby(self.cell_type_label)
-        
-    #     for cell_line in self.common_cell_lines:
-    #         if cell_line not in treatment_grouped.groups:
-    #             continue
-                
-    #         # Get all treatment samples for this cell line
-    #         treatment_indices = treatment_grouped.get_group(cell_line).index.tolist()
-    #         n_treatment_samples = len(treatment_indices)
-            
-    #         # Get all available control samples for this cell line
-    #         control_samples = self.control_grouped.get_group(cell_line)
-    #         n_control_samples = len(control_samples)
-            
-    #         if n_control_samples == 0:
-    #             logger.warning(f"No control samples found for cell line: {cell_line}")
-    #             continue
-            
-    #         # Sample with replacement if needed (when treatment > control samples)
-    #         replace_needed = n_treatment_samples > n_control_samples
-    #         if replace_needed:
-    #             logger.info(f"Cell line {cell_line}: Sampling {n_treatment_samples} controls from {n_control_samples} available (with replacement)")
-            
-    #         # Vectorized sampling: sample all needed controls at once for this cell line
-    #         sampled_controls = control_samples.sample(
-    #             n=n_treatment_samples, 
-    #             replace=replace_needed
-    #         )
-            
-    #         # Map each treatment index to its corresponding sampled control
-    #         for i, treatment_idx in enumerate(treatment_indices):
-    #             self.control_sample_mapping[treatment_idx] = sampled_controls.iloc[i]
-        
-    #     logger.info(f"Pre-sampled control samples for {len(self.control_sample_mapping)} treatment samples using vectorized approach")
     def _create_control_treatment_mapping(self):
         """
         Pre-sample control samples for each treatment sample to ensure proper randomization
         and reproducibility. Uses vectorized sampling to avoid sequential sampling bias.
-        Now matches on cell_type_label + extra_labels_to_match.
         """
         self.control_sample_mapping = {}
         
-        # Group treatment samples by all matching criteria
-        grouping_columns = [self.cell_type_label] + self.extra_labels_to_match
-        treatment_grouped = self.filtered_drug_metadata.groupby(grouping_columns)
+        # Group treatment samples by cell line
+        treatment_grouped = self.filtered_drug_metadata.groupby(self.cell_type_label)
         
-        # Handle single vs multiple grouping columns
-        single_column = len(grouping_columns) == 1
-        
-        for combination in self.common_combinations:
-            try:
-                # Adjust combination format for groupby lookup
-                if single_column:
-                    # For single column, groupby uses the value directly, not a tuple
-                    group_key = combination[0] if isinstance(combination, tuple) else combination
-                else:
-                    # For multiple columns, groupby uses tuples
-                    group_key = combination
-                
-                # Get all treatment samples for this combination
-                treatment_group = treatment_grouped.get_group(group_key)
-                treatment_indices = treatment_group.index.tolist()
-                n_treatment_samples = len(treatment_indices)
-                
-                # Get all available control samples for this combination
-                control_samples = self.control_grouped.get_group(group_key)
-                n_control_samples = len(control_samples)
-                
-                if n_control_samples == 0:
-                    combination_dict = dict(zip(grouping_columns, combination if isinstance(combination, tuple) else (combination,)))
-                    logger.warning(f"No control samples found for combination: {combination_dict}")
-                    continue
-                
-                # Sample with replacement if needed (when treatment > control samples)
-                replace_needed = n_treatment_samples > n_control_samples
-                if replace_needed:
-                    combination_dict = dict(zip(grouping_columns, combination if isinstance(combination, tuple) else (combination,)))
-                    logger.info(f"Combination {combination_dict}: Sampling {n_treatment_samples} controls from {n_control_samples} available (with replacement)")
-                
-                # Vectorized sampling: sample all needed controls at once for this combination
-                sampled_controls = control_samples.sample(
-                    n=n_treatment_samples, 
-                    replace=replace_needed
-                )
-                
-                # Map each treatment index to its corresponding sampled control
-                for i, treatment_idx in enumerate(treatment_indices):
-                    self.control_sample_mapping[treatment_idx] = sampled_controls.iloc[i]
-                    
-            except KeyError:
-                combination_dict = dict(zip(grouping_columns, combination if isinstance(combination, tuple) else (combination,)))
-                logger.warning(f"Combination not found in treatment data: {combination_dict}")
+        for cell_line in self.common_cell_lines:
+            if cell_line not in treatment_grouped.groups:
                 continue
+                
+            # Get all treatment samples for this cell line
+            treatment_indices = treatment_grouped.get_group(cell_line).index.tolist()
+            n_treatment_samples = len(treatment_indices)
+            
+            # Get all available control samples for this cell line
+            control_samples = self.control_grouped.get_group(cell_line)
+            n_control_samples = len(control_samples)
+            
+            if n_control_samples == 0:
+                logger.warning(f"No control samples found for cell line: {cell_line}")
+                continue
+            
+            # Sample with replacement if needed (when treatment > control samples)
+            replace_needed = n_treatment_samples > n_control_samples
+            if replace_needed:
+                logger.info(f"Cell line {cell_line}: Sampling {n_treatment_samples} controls from {n_control_samples} available (with replacement)")
+            
+            # Vectorized sampling: sample all needed controls at once for this cell line
+            sampled_controls = control_samples.sample(
+                n=n_treatment_samples, 
+                replace=replace_needed
+            )
+            
+            # Map each treatment index to its corresponding sampled control
+            for i, treatment_idx in enumerate(treatment_indices):
+                self.control_sample_mapping[treatment_idx] = sampled_controls.iloc[i]
         
-        logger.info(f"Pre-sampled control samples for {len(self.control_sample_mapping)} treatment samples using vectorized approach with {len(grouping_columns)} matching criteria")
-
+        logger.info(f"Pre-sampled control samples for {len(self.control_sample_mapping)} treatment samples using vectorized approach")
+    
     def __len__(self):
         return len(self.filtered_drug_metadata)
     
-    def has_transcriptomics(self) -> bool:
-        """Check if transcriptomics data is available."""
-        return self.gene_count_matrix is not None
-
-    def has_imaging(self) -> bool:
-        """Check if imaging data is available."""
-        return self.image_json_dict is not None
-        
-    def load_multi_channel_images(self, json_key: str, 
-        normalize: bool=False,
-        ) -> np.ndarray:
+    def load_multi_channel_images(self, json_key: str) -> np.ndarray:
         """
         Load all TIFF images for a sample and concatenate as 3D array.
         
@@ -277,22 +173,19 @@ class HistologyTranscriptomicsDataset(Dataset):
         images = []
         for i, path in enumerate(image_paths):
             try:
-                # logger.info(f"Loading image {i} from path: {path}")
-
                 img = tifffile.imread(path)
-
                 # Ensure 2D image (H, W)
                 if img.ndim > 2:
                     img = img.squeeze()
 
                 images.append(img)
                 
-                # # Log channel information for debugging
-                # channel_info = "w1=Blue" if "w1" in path else \
-                #               "w2=Green" if "w2" in path else \
-                #               "w3=Red" if "w3" in path else \
-                #               "w4=DeepRed" if "w4" in path else "Unknown"
-                # logger.debug(f"Loaded channel {i}: {channel_info} from {path}")
+                # Log channel information for debugging
+                channel_info = "w1=Blue" if "w1" in path else \
+                              "w2=Green" if "w2" in path else \
+                              "w3=Red" if "w3" in path else \
+                              "w4=DeepRed" if "w4" in path else "Unknown"
+                logger.debug(f"Loaded channel {i}: {channel_info} from {path}")
                 
             except Exception as e:
                 logger.error(f"Error loading image {path}: {e}")
@@ -311,7 +204,8 @@ class HistologyTranscriptomicsDataset(Dataset):
         
         return images
     
-    def get_transcriptomics_data(self, sample_id: str, adhoc_normalize: bool = False,) -> np.ndarray:
+    def get_transcriptomics_data(self, sample_id: str, adhoc_normalize: bool = False, 
+                                 ran_default_size: int=128) -> np.ndarray:
         """
         Extract transcriptomics data for a given sample_id.
         
@@ -321,17 +215,12 @@ class HistologyTranscriptomicsDataset(Dataset):
         Returns:
             1D numpy array of gene expression values
         """
-        # Handle case where gene_count_matrix is None (single modality imaging-only)
-        if self.gene_count_matrix is None:
-            logger.debug(f"No gene count matrix available, returning zeros for sample_id: {sample_id}")
-            return np.zeros((self.transcriptomics_size,), dtype=np.float32)
-        
-        if sample_id not in self.gene_count_matrix.columns:
+        if self.gene_count_matrix is not None and sample_id not in self.gene_count_matrix.columns:
             logger.error(f"self.gene_count_matrix.columns[:10]={self.gene_count_matrix.columns[:10].tolist()}")
             logger.error(f"\"{sample_id}\" in self.gene_count_matrix.columns={sample_id in self.gene_count_matrix.columns}")
             logger.error(f"gene_count_matrix.shape={self.gene_count_matrix.shape}")
             logger.warning(f"Sample ID {sample_id} not found in gene count matrix")
-            return np.zeros((self.transcriptomics_size,), dtype=np.float32)
+            return np.zeros((ran_default_size,), dtype=np.float32)
         
         if not adhoc_normalize:
             return self.gene_count_matrix[sample_id].values.astype(np.float32)
@@ -353,70 +242,9 @@ class HistologyTranscriptomicsDataset(Dataset):
         
         return normalized_data.astype(np.float32)  # Ensure float32 for consistency
     
-    # def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-    #     """
-    #     Get a paired sample (control + treatment) with conditioning information.
-    #     Handles both dual-modality and single-modality cases.
-        
-    #     Args:
-    #         idx: Index of the treatment sample
-            
-    #     Returns:
-    #         Dictionary containing paired data and conditioning information
-    #     """
-    #     # Get treatment sample metadata
-    #     treatment_sample = self.filtered_drug_metadata.iloc[idx]
-    #     cell_line = treatment_sample[self.cell_type_label]
-    #     logger.debug(f"treatment_sample={treatment_sample.to_dict()}")
-        
-    #     # Use pre-sampled control sample (fixed pairing for reproducibility)
-    #     control_sample = self.control_sample_mapping[idx]
-    #     logger.debug(f"control_sample={control_sample.to_dict()}")
-        
-    #     # Initialize result dictionary
-    #     result = {}
-        
-    #     # Load transcriptomics data only if available
-    #     if self.has_transcriptomics():
-    #         treatment_transcriptomics = self.get_transcriptomics_data(treatment_sample['sample_id'])
-    #         control_transcriptomics = self.get_transcriptomics_data(control_sample['sample_id'])
-    #         result.update({
-    #             'control_transcriptomics': torch.tensor(control_transcriptomics),
-    #             'treatment_transcriptomics': torch.tensor(treatment_transcriptomics),
-    #         })
-    #     else:
-    #         logger.debug("No transcriptomics data available, skipping transcriptomics loading")
-        
-    #     # Load multi-channel images only if available
-    #     if self.has_imaging():
-    #         treatment_images = self.load_multi_channel_images(treatment_sample.get('json_key', ''))
-    #         control_images = self.load_multi_channel_images(control_sample.get('json_key',''))
-    #         result.update({
-    #             'control_images': torch.tensor(control_images),
-    #             'treatment_images': torch.tensor(treatment_images),
-    #         })
-    #     else:
-    #         logger.debug("No imaging data available, skipping image loading")
-        
-    #     # Prepare conditioning information
-    #     conditioning_info = {
-    #         'treatment': treatment_sample['compound'],
-    #         'cell_line': cell_line,
-    #         'timepoint': treatment_sample.get('timepoint', 24.0),
-    #         'compound_concentration_in_uM': treatment_sample.get('compound_concentration_in_uM', 1.)
-    #     }
-
-    #     if np.isnan(conditioning_info.get('timepoint',24.)) or np.isnan(conditioning_info.get('compound_concentration_in_uM', 1.)):
-    #         raise ValueError(f"NaN in conditioning info: {conditioning_info}")
-
-    #     result['conditioning_info'] = conditioning_info
-        
-    #     return result
-
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Get a paired sample (control + treatment) with conditioning information.
-        Always provides consistent keys regardless of available modalities.
         
         Args:
             idx: Index of the treatment sample
@@ -433,28 +261,13 @@ class HistologyTranscriptomicsDataset(Dataset):
         control_sample = self.control_sample_mapping[idx]
         logger.debug(f"control_sample={control_sample.to_dict()}")
         
-        # Always provide transcriptomics data (zeros if not available)
-        if self.has_transcriptomics():
-            treatment_transcriptomics = self.get_transcriptomics_data(treatment_sample['sample_id'])
-            control_transcriptomics = self.get_transcriptomics_data(control_sample['sample_id'])
-            logger.debug("Loaded actual transcriptomics data")
-        else:
-            # Use the configured transcriptomics size
-            treatment_transcriptomics = np.zeros((self.transcriptomics_size,), dtype=np.float32)
-            control_transcriptomics = np.zeros((self.transcriptomics_size,), dtype=np.float32)
-            logger.debug(f"No transcriptomics data available, using zero tensors of size {self.transcriptomics_size}")
+        # Load transcriptomics data
+        treatment_transcriptomics = self.get_transcriptomics_data(treatment_sample['sample_id'])
+        control_transcriptomics = self.get_transcriptomics_data(control_sample['sample_id'])
         
-        # Always provide imaging data (zeros if not available)
-        if self.has_imaging():
-            treatment_images = self.load_multi_channel_images(treatment_sample.get('json_key', ''))
-            control_images = self.load_multi_channel_images(control_sample.get('json_key',''))
-            logger.debug("Loaded actual imaging data")
-        else:
-            # Create zero tensors with expected image dimensions
-            img_shape = (4, self.target_size or 256, self.target_size or 256)
-            treatment_images = np.zeros(img_shape, dtype=np.float32)
-            control_images = np.zeros(img_shape, dtype=np.float32)
-            logger.debug("No imaging data available, using zero tensors")
+        # Load multi-channel images
+        treatment_images = self.load_multi_channel_images(treatment_sample.get('json_key', ''))
+        control_images = self.load_multi_channel_images(control_sample.get('json_key',''))
         
         # Prepare conditioning information
         conditioning_info = {
@@ -467,16 +280,14 @@ class HistologyTranscriptomicsDataset(Dataset):
         if np.isnan(conditioning_info.get('timepoint',24.)) or np.isnan(conditioning_info.get('compound_concentration_in_uM', 1.)):
             raise ValueError(f"NaN in conditioning info: {conditioning_info}")
 
-        # Always return the same keys for consistency
-        result = {
+        # Return paired data as tensors (CORRECTED - fixed image assignment)
+        return {
             'control_transcriptomics': torch.tensor(control_transcriptomics),
             'treatment_transcriptomics': torch.tensor(treatment_transcriptomics),
             'control_images': torch.tensor(control_images),
             'treatment_images': torch.tensor(treatment_images),
             'conditioning_info': conditioning_info
         }
-        
-        return result
 
 
 class DatasetWithDrugs(HistologyTranscriptomicsDataset):
@@ -502,7 +313,6 @@ class DatasetWithDrugs(HistologyTranscriptomicsDataset):
                 smiles_cache: Optional[Dict] = None,
                 smiles_only: bool = False,
                 cell_type_label: str = 'cell_line',
-                extra_labels_to_match: Optional[List[str]] = None,
                 compound_name_label: str = 'compound',
                 **kwargs
                 ):
@@ -558,7 +368,6 @@ class DatasetWithDrugs(HistologyTranscriptomicsDataset):
             transform=transform,
             target_size=target_size,
             cell_type_label=cell_type_label,
-            extra_labels_to_match=extra_labels_to_match,
         )
         
         # Skip drug embedding loading if only SMILES needed
@@ -892,7 +701,6 @@ class RawDrugDataset(DatasetWithDrugs):
                 debug_mode=False,
                 compound_name_label='compound',
                 cell_type_label='cell_line',
-                extra_labels_to_match: Optional[List[str]] = None,
                 smiles_label='canonical_smiles',
                 smiles_cache: Optional[Dict] = None,
                 smiles_only: bool = False,
@@ -911,21 +719,6 @@ class RawDrugDataset(DatasetWithDrugs):
         
         logger.info(f"Created SMILES mapping for {len(self.drug_name_to_smiles)} drugs")
         
-        # Filter metadata_drug to only include compounds with SMILES
-        compounds_with_smiles = set(self.drug_name_to_smiles.keys())
-        original_count = len(metadata_drug)
-        
-        metadata_drug = metadata_drug[metadata_drug[compound_name_label].isin(compounds_with_smiles)].copy()
-        filtered_count = len(metadata_drug)
-        
-        if filtered_count < original_count:
-            excluded_count = original_count - filtered_count
-            logger.info(f"Filtered out {excluded_count} samples with compounds lacking SMILES")
-            logger.info(f"Retained {filtered_count} samples with valid SMILES")
-        
-        if filtered_count == 0:
-            raise ValueError("No drug samples remain after filtering by available SMILES!")
-
         if smiles_cache is None:
             self.smiles_cache = {}
         else:
@@ -943,7 +736,6 @@ class RawDrugDataset(DatasetWithDrugs):
             transform=transform,
             target_size=target_size,
             cell_type_label=cell_type_label,
-            extra_labels_to_match=extra_labels_to_match,
             debug_mode=debug_mode,
             smiles_cache=smiles_cache,
             smiles_only=smiles_only,
@@ -955,30 +747,22 @@ class RawDrugDataset(DatasetWithDrugs):
         treatment_sample = self.filtered_drug_metadata.iloc[idx]
         compound_name = treatment_sample['compound']
         
-        # Always include all keys with default values to ensure consistent batch structure
         drug_info = {
             'compound_name': compound_name,
             'smiles': self.drug_name_to_smiles.get(compound_name, ''),
-            'molecular_weight': 0.0,
-            'xlogp': 0.0,
-            'tpsa': 0.0,
         }
-
-        if not drug_info['smiles'] and compound_name not in self.warned_compounds:
-            raise ValueError(f"No SMILES found for compound: {compound_name}")
         
-        # Update with actual values if available in raw CSV
+        # Add additional drug properties if available in raw CSV
         if compound_name in self.drug_name_to_smiles:
             drug_row = self.raw_drug_df[
                 self.raw_drug_df[self.compound_name_label] == compound_name
             ]
             if not drug_row.empty:
                 row = drug_row.iloc[0]
-                # Use .get() with default values to handle missing columns
                 drug_info.update({
-                    'molecular_weight': float(row.get('molecular_weight', 0.0)),
-                    'xlogp': float(row.get('xlogp', 0.0)),
-                    'tpsa': float(row.get('tpsa', 0.0)),
+                    'molecular_weight': row.get('molecular_weight', 0),
+                    'xlogp': row.get('xlogp', 0),
+                    'tpsa': row.get('tpsa', 0),
                 })
         
         return drug_info
@@ -1020,4 +804,3 @@ class RawDrugDataset(DatasetWithDrugs):
         except ImportError:
             logger.warning("RDKit not available - SMILES fallback disabled")
             self.rdkit_available = False
-

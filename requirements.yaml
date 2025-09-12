@@ -1,4 +1,4 @@
-name: ldmol
+name: pert2mol
 channels:
   - defaults
 dependencies:
