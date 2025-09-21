@@ -5,14 +5,18 @@ import pandas as pd
 import numpy as np
 import argparse
 import time
+import logging
 from typing import Dict, List, Optional
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
-
+import torch
+from pathlib import Path
 from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors, AllChem, Scaffolds, MACCSkeys
+from rdkit.Chem import (Descriptors, rdMolDescriptors, AllChem, Scaffolds, MACCSkeys,
+    Descriptors, rdMolDescriptors, Crippen, Lipinski)
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Contrib.SA_Score import sascorer
 from rdkit import DataStructs
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 from sklearn.decomposition import PCA
@@ -21,1385 +25,940 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict, Counter
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+from collections import Counter
+from typing import List, Dict, Tuple
 
-from utils import standardize_smiles_batch_with_stats, standardize_smiles_single
+from dataloaders.dataset_gdp import create_gdp_dataloaders, create_gdp_rna_dataloaders, create_gdp_image_dataloaders
+from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
+from dataloaders.dataset_cpgjump import create_cpgjump_dataloaders
+from dataloaders.dataset_tahoe import create_tahoe_dataloaders
+from dataloaders.dataloader import create_leak_free_dataloaders
+from models import ReT_models
+from models_sra import ReT_SRA_models
+from train_autoencoder import pert2mol_autoencoder
+from utils import AE_SMILES_decoder, regexTokenizer
+from encoders import ImageEncoder, RNAEncoder, PairedRNAEncoder
+from encoders import dual_rna_image_encoder_separate as dual_rna_image_encoder
+from diffusion.rectified_flow import create_rectified_flow
+from utils import (standardize_smiles_batch_with_stats, standardize_smiles_single,
+    collect_all_drugs_from_csv, AE_SMILES_encoder)
+from evaluation_utils import (calculate_comprehensive_generation_metrics, calculate_drug_likeness_metrics, 
+    calculate_scaffold_metrics, calculate_fragment_similarity, calculate_distribution_metrics, 
+    calculate_coverage_metrics, create_three_section_summary, calculate_mode_specific_metrics, 
+    calculate_additional_generation_metrics, diversity_analysis, calculate_comprehensive_molecular_properties
+)
 
 
-class ComprehensiveMolecularEvaluator:
-    """Comprehensive molecular evaluation with multiple similarity metrics and baselines."""
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def run_pure_generation(model, flow, ae_model, y_features, pad_mask, device, args):
+    """Pure generation: generate new molecules without retrieval"""
     
-    def __init__(self, training_smiles=None, pubchem_fingerprints_path=None, reference_csv_path=None, reference_smiles_column='canonical_smiles'):
-        self.training_smiles = training_smiles or []
-        self.reference_smiles = []
-        self.reference_data = None
-        self.fingerprint_types = ['morgan_r2', 'morgan_r3', 'maccs', 'rdk', 'atom_pairs']
-        self.pubchem_fingerprints = None
+    batch_size = y_features.shape[0]
+    shape = (batch_size, 64, 127, 1)
+    
+    all_generated_smiles = []
+    
+    # Generate multiple samples per condition
+    for sample_idx in range(args.num_samples_per_condition):
+        with torch.no_grad():
+            x = torch.randn(*shape, device=device)
+            dt = 1.0 / args.generation_steps
+            
+            for i in range(args.generation_steps):
+                t = torch.full((batch_size,), i * dt, device=device)
+                t_discrete = (t * 999).long()
+                
+                velocity = model(x, t_discrete, y=y_features, pad_mask=pad_mask)
+                if isinstance(velocity, tuple):
+                    velocity = velocity[0]
+                
+                if velocity.shape[1] == 2 * x.shape[1]:
+                    velocity, _ = torch.split(velocity, x.shape[1], dim=1)
+                
+                x = x + dt * velocity
+            
+            # Decode to SMILES
+            x = x.squeeze(-1).permute((0, 2, 1))
+            batch_generated = AE_SMILES_decoder(x, ae_model, stochastic=False, k=1)
+            all_generated_smiles.extend(batch_generated)
+    
+    return all_generated_smiles
+
+
+def run_conventional_retrieval(test_batch, training_data, y_features, args):
+    """Conventional retrieval: biological similarity-based matching to find drugs"""
+    
+    retrieved_results = []
+    target_smiles = test_batch['target_smiles']
+    compound_names = test_batch['compound_name']
+    batch_size = len(target_smiles)
+    
+    if not training_data.get('biological_features'):
+        # Return empty results if no biological features
+        for i in range(batch_size):
+            retrieved_results.append({
+                'top_k_drugs': [],
+                'top_k_similarities': [],
+                'smiles_hit_rank': None,
+                'compound_hit_rank': None,
+                'smiles_in_top_k': False,
+                'compound_in_top_k': False,
+            })
+        return retrieved_results
+    
+    # Concatenate all training biological features  
+    all_training_features = torch.cat(training_data['biological_features'], dim=0)
+    
+    # Calculate similarities in biological space
+    query_flat = y_features.flatten(1)  # [batch_size, features]
+    training_flat = all_training_features.flatten(1)  # [N, features]
+    
+    # Use cosine similarity
+    similarities = cosine_similarity(query_flat.cpu(), training_flat.cpu())
+    
+    # Get top-k similar conditions for each query
+    for i in range(batch_size):
+        target_smile = target_smiles[i]
+        target_compound = compound_names[i]
         
-        # Load reference CSV dataset if provided
-        if reference_csv_path:
-            print(f"Loading reference dataset from {reference_csv_path}...")
+        sample_similarities = similarities[i]
+        top_indices = sample_similarities.argsort()[-args.retrieval_top_k:][::-1]
+        
+        # Get corresponding drugs from training data
+        top_k_smiles = [training_data['smiles'][idx] for idx in top_indices]
+        top_k_similarities = [sample_similarities[idx] for idx in top_indices]
+        top_k_compounds = [training_data['compound_names'][idx] for idx in top_indices]
+        
+        # Check if target is in top-k
+        smiles_hit_rank = None
+        compound_hit_rank = None
+        
+        for rank, (retrieved_smiles, retrieved_compound) in enumerate(zip(top_k_smiles, top_k_compounds)):
+            # Check for SMILES match
             try:
-                self.reference_data = pd.read_csv(reference_csv_path)
-                if reference_smiles_column in self.reference_data.columns:
-                    self.reference_smiles = self.reference_data[reference_smiles_column].dropna().tolist()
-                    print(f"Loaded {len(self.reference_smiles)} reference SMILES from CSV")
-                else:
-                    print(f"Warning: Column '{reference_smiles_column}' not found in CSV")
-                    available_columns = list(self.reference_data.columns)
-                    print(f"Available columns: {available_columns}")
-            except Exception as e:
-                print(f"Failed to load reference CSV: {e}")
-                self.reference_data = None
-        
-        # Load PubChem fingerprints if provided
-        if pubchem_fingerprints_path:
-            print(f"Loading PubChem fingerprints from {pubchem_fingerprints_path}...")
-            try:
-                with open(pubchem_fingerprints_path, 'rb') as f:
-                    self.pubchem_fingerprints = pickle.load(f)
-                print(f"Loaded {len(self.pubchem_fingerprints)} PubChem fingerprints")
-            except Exception as e:
-                print(f"Failed to load PubChem fingerprints: {e}")
-                self.pubchem_fingerprints = None
-        
-    def calculate_multi_fingerprint_similarity(self, target_smiles, generated_smiles):
-        """Calculate similarity using multiple fingerprint types."""
-        similarities = {}
-        
-        try:
-            target_mol = Chem.MolFromSmiles(target_smiles)
-            generated_mol = Chem.MolFromSmiles(generated_smiles)
-            
-            if target_mol is None or generated_mol is None:
-                return {fp_type: 0.0 for fp_type in self.fingerprint_types}
-            
-            # Morgan fingerprints with different radii
-            target_morgan_r2 = rdMolDescriptors.GetMorganFingerprintAsBitVect(target_mol, 2)
-            gen_morgan_r2 = rdMolDescriptors.GetMorganFingerprintAsBitVect(generated_mol, 2)
-            similarities['morgan_r2'] = DataStructs.TanimotoSimilarity(target_morgan_r2, gen_morgan_r2)
-            
-            target_morgan_r3 = rdMolDescriptors.GetMorganFingerprintAsBitVect(target_mol, 3)
-            gen_morgan_r3 = rdMolDescriptors.GetMorganFingerprintAsBitVect(generated_mol, 3)
-            similarities['morgan_r3'] = DataStructs.TanimotoSimilarity(target_morgan_r3, gen_morgan_r3)
-            
-            # MACCS keys
-            target_maccs = MACCSkeys.GenMACCSKeys(target_mol)
-            gen_maccs = MACCSkeys.GenMACCSKeys(generated_mol)
-            similarities['maccs'] = DataStructs.TanimotoSimilarity(target_maccs, gen_maccs)
-            
-            # RDKit fingerprint
-            target_rdk = Chem.RDKFingerprint(target_mol)
-            gen_rdk = Chem.RDKFingerprint(generated_mol)
-            similarities['rdk'] = DataStructs.TanimotoSimilarity(target_rdk, gen_rdk)
-            
-            # Atom pairs
-            target_pairs = rdMolDescriptors.GetAtomPairFingerprint(target_mol)
-            gen_pairs = rdMolDescriptors.GetAtomPairFingerprint(generated_mol)
-            similarities['atom_pairs'] = DataStructs.TanimotoSimilarity(target_pairs, gen_pairs)
-            
-        except Exception as e:
-            print(f"Error calculating fingerprint similarities: {e}")
-            similarities = {fp_type: 0.0 for fp_type in self.fingerprint_types}
-            
-        return similarities
-    
-    def calculate_scaffold_similarity(self, target_smiles, generated_smiles):
-        """Calculate Murcko scaffold similarity."""
-        try:
-            target_mol = Chem.MolFromSmiles(target_smiles)
-            generated_mol = Chem.MolFromSmiles(generated_smiles)
-            
-            if target_mol is None or generated_mol is None:
-                return 0.0
-            
-            target_scaffold = MurckoScaffold.GetScaffoldForMol(target_mol)
-            generated_scaffold = MurckoScaffold.GetScaffoldForMol(generated_mol)
-            
-            if target_scaffold is None or generated_scaffold is None:
-                return 0.0
-            
-            target_scaffold_fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(target_scaffold, 2)
-            gen_scaffold_fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(generated_scaffold, 2)
-            
-            return DataStructs.TanimotoSimilarity(target_scaffold_fp, gen_scaffold_fp)
-            
-        except Exception as e:
-            print(f"Error calculating scaffold similarity: {e}")
-            return 0.0
-    
-    def calculate_novelty_score(self, generated_smiles, use_pubchem=True, use_reference_csv=True):
-        """Calculate novelty of generated molecule vs training set, reference CSV, or PubChem."""
-        if not generated_smiles:
-            return 0.0, 'none'
-        
-        try:
-            generated_mol = Chem.MolFromSmiles(generated_smiles)
-            if generated_mol is None:
-                return 0.0, 'invalid'
-            
-            generated_fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(generated_mol, 2)
-            max_similarity = 0.0
-            comparison_set = None
-            
-            # Priority: PubChem > Reference CSV > Training set
-            if use_pubchem and self.pubchem_fingerprints:
-                print("Using PubChem for novelty calculation...")
-                comparison_set = 'pubchem'
-                for pubchem_smiles, pubchem_fp in self.pubchem_fingerprints.items():
-                    try:
-                        sim = DataStructs.TanimotoSimilarity(generated_fp, pubchem_fp)
-                        max_similarity = max(max_similarity, sim)
-                        if max_similarity > 0.99:  # Early stopping for near-perfect matches
-                            break
-                    except:
-                        continue
-                        
-            elif use_reference_csv and self.reference_smiles:
-                comparison_set = 'reference_csv'
-                for ref_smiles in self.reference_smiles:
-                    try:
-                        ref_mol = Chem.MolFromSmiles(ref_smiles)
-                        if ref_mol is not None:
-                            ref_fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(ref_mol, 2)
-                            sim = DataStructs.TanimotoSimilarity(generated_fp, ref_fp)
-                            max_similarity = max(max_similarity, sim)
-                            if max_similarity > 0.99:
-                                break
-                    except:
-                        continue
-                        
-            else:
-                # Fallback to training set
-                comparison_set = 'training_set'
-                for train_smiles in self.training_smiles:
-                    try:
-                        train_mol = Chem.MolFromSmiles(train_smiles)
-                        if train_mol is not None:
-                            train_fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(train_mol, 2)
-                            sim = DataStructs.TanimotoSimilarity(generated_fp, train_fp)
-                            max_similarity = max(max_similarity, sim)
-                    except:
-                        continue
-            
-            novelty_score = 1.0 - max_similarity
-            return novelty_score, comparison_set
-            
-        except Exception as e:
-            print(f"Error calculating novelty: {e}")
-            return 0.0, 'error'
-
-
-# def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0.9]):
-#     """Calculate retrieval accuracy, precision, recall, F1 for different similarity thresholds."""
-    
-#     retrieval_results = [r for r in results if r.get('method') == 'retrieval' and r.get('is_valid', False)]
-    
-#     if not retrieval_results:
-#         return {}
-    
-#     metrics_by_threshold = {}
-    
-#     for threshold in similarity_thresholds:
-#         # Classification based on similarity threshold
-#         true_positives = 0
-#         false_positives = 0 
-#         false_negatives = 0
-#         true_negatives = 0
-        
-#         exact_matches = 0
-#         top_k_hits = 0
-#         total_samples = len(retrieval_results)
-        
-#         for result in retrieval_results:
-#             target_smiles = result['target_smiles']
-#             generated_smiles = result['generated_smiles']
-#             all_candidates = result.get('all_candidates', [])
-            
-#             # Calculate similarity between target and generated
-#             similarity_score = 0.0
-#             if 'similarity_analysis' in result:
-#                 # Use Morgan fingerprint similarity as main metric
-#                 similarity_score = result['similarity_analysis'].get('morgan_r2', 0.0)
-            
-#             # Exact match check
-#             if target_smiles == generated_smiles:
-#                 exact_matches += 1
-            
-#             # Top-k hit check (target in any candidate)
-#             target_in_candidates = target_smiles in all_candidates
-#             if target_in_candidates:
-#                 top_k_hits += 1
-            
-#             # Get similarity score for this sample
-#             if 'similarity_analysis' in result and 'morgan_r2' in result['similarity_analysis']:
-#                 similarity_score = result['similarity_analysis']['morgan_r2']
-#             else:
-#                 similarity_score = 0.0
-            
-#             # Binary classification based on similarity threshold
-#             predicted_positive = similarity_score >= threshold
-            
-#             # Ground truth: exact molecular match (canonical SMILES)
-#             try:
-#                 target_mol = Chem.MolFromSmiles(target_smiles)
-#                 generated_mol = Chem.MolFromSmiles(generated_smiles)
-                
-#                 if target_mol is not None and generated_mol is not None:
-#                     target_canonical = Chem.MolToSmiles(target_mol, canonical=True)
-#                     generated_canonical = Chem.MolToSmiles(generated_mol, canonical=True)
-#                     actual_positive = target_canonical == generated_canonical
-#                 else:
-#                     actual_positive = False
-#             except:
-#                 actual_positive = target_smiles == generated_smiles  # Fallback to string match
-            
-#             if predicted_positive and actual_positive:
-#                 true_positives += 1
-#             elif predicted_positive and not actual_positive:
-#                 false_positives += 1
-#             elif not predicted_positive and actual_positive:
-#                 false_negatives += 1
-#             else:
-#                 true_negatives += 1
-        
-#         # Calculate metrics
-#         precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
-#         recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
-#         f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-#         accuracy = (true_positives + true_negatives) / total_samples if total_samples > 0 else 0.0
-        
-#         metrics_by_threshold[f'threshold_{threshold}'] = {
-#             'threshold': threshold,
-#             'precision': precision,
-#             'recall': recall,
-#             'f1_score': f1_score,
-#             'accuracy': accuracy,
-#             'true_positives': true_positives,
-#             'false_positives': false_positives,
-#             'true_negatives': true_negatives,
-#             'false_negatives': false_negatives
-#         }
-    
-#     # Overall retrieval metrics (threshold-independent)
-#     overall_metrics = {
-#         'exact_match_accuracy': exact_matches / total_samples if total_samples > 0 else 0.0,
-#         'top_k_hit_rate': top_k_hits / total_samples if total_samples > 0 else 0.0,
-#         'exact_matches': exact_matches,
-#         'top_k_hits': top_k_hits,
-#         'total_samples': total_samples
-#     }
-    
-#     return {
-#         'threshold_based_metrics': metrics_by_threshold,
-#         'overall_retrieval_metrics': overall_metrics
-#     }
-
-
-def calculate_retrieval_metrics(results, similarity_thresholds=[0.5, 0.7, 0.8, 0.9]):
-    """Calculate retrieval accuracy, precision, recall, F1 for different similarity thresholds."""
-    
-    retrieval_results = [r for r in results if r.get('method') == 'retrieval' and r.get('is_valid', False)]
-    
-    if not retrieval_results:
-        return {}
-    
-    metrics_by_threshold = {}
-    
-    # Add evaluator instance for similarity calculations
-    evaluator = ComprehensiveMolecularEvaluator()
-    
-    for threshold in similarity_thresholds:
-        # Classification based on similarity threshold
-        true_positives = 0
-        false_positives = 0 
-        false_negatives = 0
-        true_negatives = 0
-        
-        exact_matches = 0
-        top_k_hits = 0
-        total_samples = len(retrieval_results)
-        
-        # New: similarity-based matches
-        similarity_matches = 0
-        property_similar_matches = 0
-        
-        for result in retrieval_results:
-            target_smiles = result['target_smiles']
-            generated_smiles = result['generated_smiles']
-            all_candidates = result.get('all_candidates', [])
-            
-            # Calculate multiple similarity metrics
-            similarity_scores = evaluator.calculate_multi_fingerprint_similarity(target_smiles, generated_smiles)
-            scaffold_similarity = evaluator.calculate_scaffold_similarity(target_smiles, generated_smiles)
-            
-            # Use Morgan fingerprint similarity as primary metric
-            primary_similarity = similarity_scores.get('morgan_r2', 0.0)
-            
-            # Exact match check
-            if target_smiles == generated_smiles:
-                exact_matches += 1
-            
-            # Similarity-based match check
-            if primary_similarity >= threshold:
-                similarity_matches += 1
-            
-            # Property-based similarity check
-            target_props = calculate_comprehensive_molecular_properties(target_smiles)
-            generated_props = calculate_comprehensive_molecular_properties(generated_smiles)
-            
-            property_similarity = 0.0
-            if target_props and generated_props:
-                # Calculate normalized property similarity
-                key_props = ['MW', 'LogP', 'TPSA', 'HBA', 'HBD', 'RotBonds']
-                prop_similarities = []
-                
-                for prop in key_props:
-                    if prop in target_props and prop in generated_props:
-                        target_val = target_props[prop]
-                        generated_val = generated_props[prop]
-                        
-                        # Normalize by range (using typical drug-like ranges)
-                        prop_ranges = {
-                            'MW': 500, 'LogP': 10, 'TPSA': 200, 
-                            'HBA': 15, 'HBD': 10, 'RotBonds': 20
-                        }
-                        
-                        if prop in prop_ranges and prop_ranges[prop] > 0:
-                            normalized_diff = abs(target_val - generated_val) / prop_ranges[prop]
-                            prop_sim = max(0, 1 - normalized_diff)
-                            prop_similarities.append(prop_sim)
-                
-                if prop_similarities:
-                    property_similarity = np.mean(prop_similarities)
-            
-            if property_similarity >= threshold:
-                property_similar_matches += 1
-            
-            # Top-k hit check (target in any candidate)
-            target_in_candidates = target_smiles in all_candidates
-            if target_in_candidates:
-                top_k_hits += 1
-            
-            # Binary classification based on similarity threshold
-            predicted_positive = primary_similarity >= threshold
-            
-            # Ground truth options - you can choose which one to use:
-            
-            # Option 1: Exact molecular match (your current approach)
-            try:
-                target_mol = Chem.MolFromSmiles(target_smiles)
-                generated_mol = Chem.MolFromSmiles(generated_smiles)
-                
-                if target_mol is not None and generated_mol is not None:
-                    target_canonical = Chem.MolToSmiles(target_mol, canonical=True)
-                    generated_canonical = Chem.MolToSmiles(generated_mol, canonical=True)
-                    actual_positive_exact = target_canonical == generated_canonical
-                else:
-                    actual_positive_exact = False
+                target_canonical = Chem.MolToSmiles(Chem.MolFromSmiles(target_smile), canonical=True)
+                retrieved_canonical = Chem.MolToSmiles(Chem.MolFromSmiles(retrieved_smiles), canonical=True)
+                if target_canonical == retrieved_canonical and smiles_hit_rank is None:
+                    smiles_hit_rank = rank + 1
             except:
-                actual_positive_exact = target_smiles == generated_smiles
+                if target_smile == retrieved_smiles and smiles_hit_rank is None:
+                    smiles_hit_rank = rank + 1
             
-            # Option 2: Similarity-based ground truth (more flexible)
-            actual_positive_similarity = primary_similarity >= 0.8  # High similarity threshold for "ground truth"
+            # Check for compound name match
+            if target_compound == retrieved_compound and compound_hit_rank is None:
+                compound_hit_rank = rank + 1
             
-            # Option 3: Multi-criteria ground truth
-            multi_criteria_score = (
-                similarity_scores.get('morgan_r2', 0) * 0.4 +
-                similarity_scores.get('maccs', 0) * 0.2 +
-                scaffold_similarity * 0.2 +
-                property_similarity * 0.2
-            )
-            actual_positive_multi = multi_criteria_score >= 0.7
-            
-            # Choose which ground truth to use (you can switch between these)
-            actual_positive = actual_positive_exact  # Default to exact match
-            # actual_positive = actual_positive_similarity  # Uncomment for similarity-based
-            # actual_positive = actual_positive_multi  # Uncomment for multi-criteria
-            
-            if predicted_positive and actual_positive:
-                true_positives += 1
-            elif predicted_positive and not actual_positive:
-                false_positives += 1
-            elif not predicted_positive and actual_positive:
-                false_negatives += 1
-            else:
-                true_negatives += 1
-        
-        # Calculate metrics
-        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
-        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
-        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        accuracy = (true_positives + true_negatives) / total_samples if total_samples > 0 else 0.0
-        
-        metrics_by_threshold[f'threshold_{threshold}'] = {
-            'threshold': threshold,
-            'precision': precision,
-            'recall': recall,
-            'f1_score': f1_score,
-            'accuracy': accuracy,
-            'true_positives': true_positives,
-            'false_positives': false_positives,
-            'true_negatives': true_negatives,
-            'false_negatives': false_negatives,
-            # New similarity-based metrics
-            'similarity_matches': similarity_matches,
-            'property_similar_matches': property_similar_matches,
-            'similarity_match_rate': similarity_matches / total_samples if total_samples > 0 else 0.0,
-            'property_similarity_rate': property_similar_matches / total_samples if total_samples > 0 else 0.0
-        }
-    
-    # Overall retrieval metrics (threshold-independent)
-    overall_metrics = {
-        'exact_match_accuracy': exact_matches / total_samples if total_samples > 0 else 0.0,
-        'top_k_hit_rate': top_k_hits / total_samples if total_samples > 0 else 0.0,
-        'exact_matches': exact_matches,
-        'top_k_hits': top_k_hits,
-        'total_samples': total_samples
-    }
-    
-    return {
-        'threshold_based_metrics': metrics_by_threshold,
-        'overall_retrieval_metrics': overall_metrics
-    }
-
-
-def calculate_multi_candidate_metrics(results):
-    """Evaluate all candidates, not just the best one."""
-    
-    retrieval_results = [r for r in results if r.get('method') == 'retrieval']
-    
-    if not retrieval_results:
-        return {}
-    
-    multi_candidate_stats = {
-        'target_in_top_1': 0,
-        'target_in_top_3': 0,
-        'target_in_top_5': 0,
-        'avg_target_rank': [],
-        'total_samples': 0
-    }
-    
-    for result in retrieval_results:
-        target_smiles = result['target_smiles']
-        all_candidates = result.get('all_candidates', [])
-        
-        if not all_candidates:
-            continue
-            
-        multi_candidate_stats['total_samples'] += 1
-        
-        # Check if target is in candidates and at what rank
-        target_rank = None
-        for i, candidate in enumerate(all_candidates):
-            if candidate == target_smiles:
-                target_rank = i + 1  # 1-based ranking
+            if smiles_hit_rank is not None and compound_hit_rank is not None:
                 break
         
-        if target_rank is not None:
-            multi_candidate_stats['avg_target_rank'].append(target_rank)
+        retrieved_results.append({
+            'top_k_drugs': top_k_smiles,
+            'top_k_similarities': top_k_similarities,
+            'smiles_hit_rank': smiles_hit_rank,
+            'compound_hit_rank': compound_hit_rank,
+            'smiles_in_top_k': smiles_hit_rank is not None,
+            'compound_in_top_k': compound_hit_rank is not None,
+        })
+    
+    return retrieved_results
+
+
+def run_retrieval_by_generation(test_batch, training_data, model, flow, ae_model, 
+                                y_features, pad_mask, device, args):
+    """Retrieval by generation: use model to generate drug embeddings, then find similar drugs in dataset"""
+    
+    retrieved_results = []
+    target_smiles = test_batch['target_smiles']
+    compound_names = test_batch['compound_name']
+    batch_size = len(target_smiles)
+    
+    # Step 1: Use trained model to generate drug embeddings from biological features
+    with torch.no_grad():
+        shape = (batch_size, 64, 127, 1)
+        x = torch.randn(*shape, device=device)
+        dt = 1.0 / args.generation_steps
+        
+        # Run diffusion process to get drug latent representations
+        for i in range(args.generation_steps):
+            t = torch.full((batch_size,), i * dt, device=device)
+            t_discrete = (t * 999).long()
             
-            if target_rank <= 1:
-                multi_candidate_stats['target_in_top_1'] += 1
-            if target_rank <= 3:
-                multi_candidate_stats['target_in_top_3'] += 1
-            if target_rank <= 5:
-                multi_candidate_stats['target_in_top_5'] += 1
-    
-    total_samples = multi_candidate_stats['total_samples']
-    if total_samples > 0:
-        multi_candidate_stats['hit_rate_top_1'] = multi_candidate_stats['target_in_top_1'] / total_samples
-        multi_candidate_stats['hit_rate_top_3'] = multi_candidate_stats['target_in_top_3'] / total_samples  
-        multi_candidate_stats['hit_rate_top_5'] = multi_candidate_stats['target_in_top_5'] / total_samples
+            velocity = model(x, t_discrete, y=y_features, pad_mask=pad_mask)
+            if isinstance(velocity, tuple):
+                velocity = velocity[0]
+            
+            if velocity.shape[1] == 2 * x.shape[1]:
+                velocity, _ = torch.split(velocity, x.shape[1], dim=1)
+            
+            x = x + dt * velocity
         
-        if multi_candidate_stats['avg_target_rank']:
-            multi_candidate_stats['mean_reciprocal_rank'] = np.mean([1.0/rank for rank in multi_candidate_stats['avg_target_rank']])
-            multi_candidate_stats['avg_target_rank'] = np.mean(multi_candidate_stats['avg_target_rank'])
-        else:
-            multi_candidate_stats['mean_reciprocal_rank'] = 0.0
-            multi_candidate_stats['avg_target_rank'] = float('inf')
+        # Generated drug latent representations
+        generated_drug_latents = x.squeeze(-1).permute((0, 2, 1))
     
-    return multi_candidate_stats
+    # Step 2: Get embeddings for all drugs in the dataset using the autoencoder
+    dataset_smiles = training_data['smiles']
+    dataset_compound_names = training_data['compound_names']
+    
+    # Batch process dataset drugs to get their latent representations
+    dataset_latents = []
+    batch_size_train = 32
+    
+    with torch.no_grad():
+        for i in range(0, len(dataset_smiles), batch_size_train):
+            batch_smiles = dataset_smiles[i:i+batch_size_train]
+            train_latents_batch = AE_SMILES_encoder(batch_smiles, ae_model).permute((0, 2, 1))
+            dataset_latents.append(train_latents_batch)
+        
+        dataset_latents = torch.cat(dataset_latents, dim=0)
+    
+    # Step 3: Compare generated latents to dataset drug latents
+    for i in range(batch_size):
+        generated_latent = generated_drug_latents[i]
+        target_smile = target_smiles[i]
+        target_compound = compound_names[i]
+        
+        # Calculate similarities in drug latent space
+        similarities = []
+        
+        for j, dataset_latent in enumerate(dataset_latents):
+            gen_flat = generated_latent.flatten()
+            dataset_flat = dataset_latent.flatten()
+            
+            similarity = torch.cosine_similarity(gen_flat.unsqueeze(0), dataset_flat.unsqueeze(0))
+            similarities.append((j, similarity.item()))
+        
+        # Sort by similarity and get top-k
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        top_k_indices = similarities[:args.retrieval_by_generation_top_k]
+        
+        # Extract top-k drugs
+        top_k_smiles = [dataset_smiles[idx] for idx, _ in top_k_indices]
+        top_k_similarities = [sim for _, sim in top_k_indices]
+        top_k_compounds = [dataset_compound_names[idx] for idx, _ in top_k_indices]
+        
+        # Check if target is in top-k
+        smiles_hit_rank = None
+        compound_hit_rank = None
+        
+        for rank, (retrieved_smiles, retrieved_compound) in enumerate(zip(top_k_smiles, top_k_compounds)):
+            # Check for SMILES match
+            try:
+                target_canonical = Chem.MolToSmiles(Chem.MolFromSmiles(target_smile), canonical=True)
+                retrieved_canonical = Chem.MolToSmiles(Chem.MolFromSmiles(retrieved_smiles), canonical=True)
+                if target_canonical == retrieved_canonical and smiles_hit_rank is None:
+                    smiles_hit_rank = rank + 1
+            except:
+                if target_smile == retrieved_smiles and smiles_hit_rank is None:
+                    smiles_hit_rank = rank + 1
+            
+            # Check for compound name match
+            if target_compound == retrieved_compound and compound_hit_rank is None:
+                compound_hit_rank = rank + 1
+            
+            if smiles_hit_rank is not None and compound_hit_rank is not None:
+                break
+        
+        retrieved_results.append({
+            'top_k_drugs': top_k_smiles,
+            'top_k_similarities': top_k_similarities,
+            'smiles_hit_rank': smiles_hit_rank,
+            'compound_hit_rank': compound_hit_rank,
+            'smiles_in_top_k': smiles_hit_rank is not None,
+            'compound_in_top_k': compound_hit_rank is not None,
+        })
+    
+    # Return both retrieval results and generated embeddings
+    return retrieved_results, generated_drug_latents.cpu().numpy(), dataset_latents.cpu().numpy()
 
 
-def calculate_comprehensive_molecular_properties(smiles):
-    """Extended molecular property calculation."""
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
-        
-        Chem.SanitizeMol(mol)
-        props = {}
-        
-        # Basic properties
-        props['MW'] = Descriptors.MolWt(mol)
-        props['LogP'] = Descriptors.MolLogP(mol)
-        props['HBA'] = Descriptors.NumHAcceptors(mol)
-        props['HBD'] = Descriptors.NumHDonors(mol)
-        props['TPSA'] = Descriptors.TPSA(mol)
-        props['RotBonds'] = Descriptors.NumRotatableBonds(mol)
-        props['AromaticRings'] = Descriptors.NumAromaticRings(mol)
-        props['HeavyAtoms'] = Descriptors.HeavyAtomCount(mol)
-        props['FractionCsp3'] = rdMolDescriptors.CalcFractionCSP3(mol)
-        props['QED'] = Descriptors.qed(mol)
-        
-        # Additional descriptors
-        props['BertzCT'] = Descriptors.BertzCT(mol)  # Complexity
-        props['MolMR'] = Descriptors.MolMR(mol)  # Molar refractivity
-        props['NumRings'] = Descriptors.RingCount(mol)
-        props['NumHeteroatoms'] = Descriptors.NumHeteroatoms(mol)
-        props['NumSaturatedRings'] = Descriptors.NumSaturatedRings(mol)
-        props['NumAliphaticRings'] = Descriptors.NumAliphaticRings(mol)
-        
-        # Drug-likeness indicators
-        props['Lipinski_violations'] = sum([
-            props['MW'] > 500,
-            props['LogP'] > 5,
-            props['HBA'] > 10,
-            props['HBD'] > 5
-        ])
-        
-        # Veber's rule
-        props['Veber_violations'] = sum([
-            props['RotBonds'] > 10,
-            props['TPSA'] > 140
-        ])
-        
-        return props
-        
-    except Exception as e:
-        print(f"Failed to process SMILES {smiles}: {e}")
-        return None
-
-
-def calculate_comprehensive_similarity_metrics(results, similarity_thresholds=[0.3, 0.5, 0.7, 0.8, 0.9]):
-    """
-    Calculate comprehensive similarity-based evaluation metrics beyond exact matches.
+def run_three_mode_evaluation(test_batch, training_data, model, flow, ae_model, 
+                             image_encoder, rna_encoder, y_features, pad_mask, device, args):
+    """Run evaluation in all three modes: pure generation, conventional retrieval, and retrieval by generation"""
     
-    Args:
-        results: List of evaluation results
-        similarity_thresholds: List of similarity thresholds to evaluate
+    batch_size = len(test_batch['target_smiles'])
+    results_by_mode = {'pure_generation': [], 'conventional_retrieval': [], 'retrieval_by_generation': []}
     
-    Returns:
-        Dictionary with comprehensive similarity metrics
-    """
-    valid_results = [r for r in results if r.get('is_valid', False)]
-    
-    if not valid_results:
-        return {}
-    
-    evaluator = ComprehensiveMolecularEvaluator()
-    
-    # Initialize metrics storage
-    similarity_metrics = {
-        'fingerprint_similarities': [],
-        'scaffold_similarities': [],
-        'property_similarities': [],
-        'multi_criteria_similarities': [],
-        'similarity_distribution': {},
-        'threshold_performance': {}
-    }
-    
-    print("Calculating comprehensive similarity metrics...")
-    
-    for result in tqdm(valid_results, desc="Computing similarities"):
-        target_smiles = result['target_smiles']
-        generated_smiles = result['generated_smiles']
+    # Mode 1: Pure Generation
+    if args.run_generation:
+        # logger.info("Running pure generation mode...")
+        generated_smiles_list = run_pure_generation(model, flow, ae_model, y_features, pad_mask, device, args)
         
-        # Calculate multiple fingerprint similarities
-        fp_similarities = evaluator.calculate_multi_fingerprint_similarity(target_smiles, generated_smiles)
-        scaffold_sim = evaluator.calculate_scaffold_similarity(target_smiles, generated_smiles)
+        # Process generation results
+        samples_per_condition = args.num_samples_per_condition
+        for i in range(batch_size):
+            # Get all samples for this condition
+            condition_samples = []
+            for sample_idx in range(samples_per_condition):
+                idx = i * samples_per_condition + sample_idx
+                if idx < len(generated_smiles_list):
+                    condition_samples.append(generated_smiles_list[idx])
+            
+            # Select best sample (by validity first, then random)
+            valid_samples = []
+            for smiles in condition_samples:
+                try:
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is not None:
+                        canonical = Chem.MolToSmiles(mol, canonical=True)
+                        valid_samples.append((smiles, canonical, True))
+                    else:
+                        valid_samples.append((smiles, smiles, False))
+                except:
+                    valid_samples.append((smiles, smiles, False))
+            
+            # Choose best sample
+            valid_only = [s for s in valid_samples if s[2]]
+            if valid_only:
+                best_sample = valid_only[0]  # Take first valid
+            else:
+                best_sample = valid_samples[0] if valid_samples else ("", "", False)
+            
+            results_by_mode['pure_generation'].append({
+                'sample_id': i + 1,
+                'method': 'pure_generation',
+                'target_smiles': test_batch['target_smiles'][i],
+                'compound_name': test_batch['compound_name'][i],
+                'generated_smiles': best_sample[1],
+                'is_valid': best_sample[2],
+                'all_samples': condition_samples,
+                'confidence': 0.8 if best_sample[2] else 0.1
+            })
+    
+    # Mode 2: Conventional Retrieval (Biological Similarity)
+    if args.run_conventional_retrieval:
+        # logger.info("Running conventional retrieval mode...")
+        retrieval_results = run_conventional_retrieval(test_batch, training_data, y_features, args)
         
-        # Calculate property-based similarity
-        target_props = calculate_comprehensive_molecular_properties(target_smiles)
-        generated_props = calculate_comprehensive_molecular_properties(generated_smiles)
-        
-        property_similarity = calculate_property_similarity(target_props, generated_props)
-        
-        # Calculate multi-criteria similarity score
-        multi_criteria_sim = calculate_multi_criteria_similarity(
-            fp_similarities, scaffold_sim, property_similarity
+        for i in range(batch_size):
+            retrieval_result = retrieval_results[i] if i < len(retrieval_results) else {}
+            
+            # Get best retrieved drug
+            if retrieval_result.get('top_k_drugs'):
+                best_retrieved = retrieval_result['top_k_drugs'][0]
+                confidence = retrieval_result['top_k_similarities'][0] if retrieval_result['top_k_similarities'] else 0.0
+                is_valid = True
+            else:
+                best_retrieved = ""
+                confidence = 0.0
+                is_valid = False
+            
+            result = {
+                'sample_id': i + 1,
+                'method': 'conventional_retrieval',
+                'target_smiles': test_batch['target_smiles'][i],
+                'compound_name': test_batch['compound_name'][i],
+                'generated_smiles': best_retrieved,
+                'is_valid': is_valid,
+                'confidence': float(confidence),
+            }
+            result.update(retrieval_result)  # Add retrieval-specific metrics
+            results_by_mode['conventional_retrieval'].append(result)
+    
+    # Mode 3: Retrieval by Generation (Model-based Drug Mapping)
+    generated_embeddings = None
+    reference_embeddings = None
+    
+    if args.run_retrieval_by_generation:
+        # logger.info("Running retrieval by generation mode...")
+        retrieval_by_gen_results, generated_embeddings, reference_embeddings = run_retrieval_by_generation(
+            test_batch, training_data, model, flow, ae_model, y_features, pad_mask, device, args
         )
         
-        # Store individual similarities
-        similarity_metrics['fingerprint_similarities'].append(fp_similarities)
-        similarity_metrics['scaffold_similarities'].append(scaffold_sim)
-        similarity_metrics['property_similarities'].append(property_similarity)
-        similarity_metrics['multi_criteria_similarities'].append(multi_criteria_sim)
-        
-        # Store in result for later use
-        result['comprehensive_similarity'] = {
-            'fingerprint': fp_similarities,
-            'scaffold': scaffold_sim,
-            'property': property_similarity,
-            'multi_criteria': multi_criteria_sim
-        }
-    
-    # Calculate distribution statistics for each similarity type
-    similarity_types = ['morgan_r2', 'morgan_r3', 'maccs', 'rdk', 'atom_pairs']
-    
-    for sim_type in similarity_types:
-        values = [fp_sim.get(sim_type, 0) for fp_sim in similarity_metrics['fingerprint_similarities']]
-        similarity_metrics['similarity_distribution'][sim_type] = {
-            'mean': np.mean(values),
-            'std': np.std(values),
-            'median': np.median(values),
-            'min': np.min(values),
-            'max': np.max(values),
-            'percentile_25': np.percentile(values, 25),
-            'percentile_75': np.percentile(values, 75)
-        }
-    
-    # Add scaffold and property similarity distributions
-    scaffold_values = similarity_metrics['scaffold_similarities']
-    property_values = similarity_metrics['property_similarities']
-    multi_criteria_values = similarity_metrics['multi_criteria_similarities']
-    
-    for name, values in [('scaffold', scaffold_values), ('property', property_values), ('multi_criteria', multi_criteria_values)]:
-        similarity_metrics['similarity_distribution'][name] = {
-            'mean': np.mean(values),
-            'std': np.std(values),
-            'median': np.median(values),
-            'min': np.min(values),
-            'max': np.max(values),
-            'percentile_25': np.percentile(values, 25),
-            'percentile_75': np.percentile(values, 75)
-        }
-    
-    # Calculate threshold-based performance for different similarity metrics
-    for threshold in similarity_thresholds:
-        threshold_results = {}
-        
-        for sim_type in similarity_types + ['scaffold', 'property', 'multi_criteria']:
-            if sim_type in similarity_types:
-                values = [fp_sim.get(sim_type, 0) for fp_sim in similarity_metrics['fingerprint_similarities']]
-            elif sim_type == 'scaffold':
-                values = scaffold_values
-            elif sim_type == 'property':
-                values = property_values
-            elif sim_type == 'multi_criteria':
-                values = multi_criteria_values
+        for i in range(batch_size):
+            retrieval_by_gen_result = retrieval_by_gen_results[i] if i < len(retrieval_by_gen_results) else {}
             
-            # Calculate how many molecules meet the threshold
-            above_threshold = sum(1 for v in values if v >= threshold)
-            threshold_results[sim_type] = {
-                'count_above_threshold': above_threshold,
-                'percentage_above_threshold': above_threshold / len(values) * 100 if values else 0,
-                'mean_above_threshold': np.mean([v for v in values if v >= threshold]) if any(v >= threshold for v in values) else 0
+            # Get best result from model-based retrieval
+            if retrieval_by_gen_result.get('top_k_drugs'):
+                best_model_retrieved = retrieval_by_gen_result['top_k_drugs'][0]
+                confidence = retrieval_by_gen_result['top_k_similarities'][0] if retrieval_by_gen_result['top_k_similarities'] else 0.0
+                is_valid = True
+            else:
+                best_model_retrieved = ""
+                confidence = 0.0
+                is_valid = False
+            
+            result = {
+                'sample_id': i + 1,
+                'method': 'retrieval_by_generation',
+                'target_smiles': test_batch['target_smiles'][i],
+                'compound_name': test_batch['compound_name'][i],
+                'generated_smiles': best_model_retrieved,
+                'is_valid': is_valid,
+                'confidence': float(confidence),
             }
-        
-        similarity_metrics['threshold_performance'][f'threshold_{threshold}'] = threshold_results
+            result.update(retrieval_by_gen_result)  # Add retrieval-specific metrics
+            results_by_mode['retrieval_by_generation'].append(result)
     
-    # Calculate similarity-based retrieval success rates
-    retrieval_success = {
-        'high_similarity_retrieval': 0,  # Morgan similarity > 0.8
-        'moderate_similarity_retrieval': 0,  # Morgan similarity > 0.5
-        'scaffold_preserved_retrieval': 0,  # Scaffold similarity > 0.7
-        'property_similar_retrieval': 0,  # Property similarity > 0.7
-        'multi_criteria_success': 0  # Multi-criteria > 0.7
-    }
-    
-    total_samples = len(valid_results)
-    
-    for result in valid_results:
-        comp_sim = result.get('comprehensive_similarity', {})
-        fp_sim = comp_sim.get('fingerprint', {})
-        
-        morgan_sim = fp_sim.get('morgan_r2', 0)
-        scaffold_sim = comp_sim.get('scaffold', 0)
-        property_sim = comp_sim.get('property', 0)
-        multi_criteria_sim = comp_sim.get('multi_criteria', 0)
-        
-        if morgan_sim > 0.8:
-            retrieval_success['high_similarity_retrieval'] += 1
-        if morgan_sim > 0.5:
-            retrieval_success['moderate_similarity_retrieval'] += 1
-        if scaffold_sim > 0.7:
-            retrieval_success['scaffold_preserved_retrieval'] += 1
-        if property_sim > 0.7:
-            retrieval_success['property_similar_retrieval'] += 1
-        if multi_criteria_sim > 0.7:
-            retrieval_success['multi_criteria_success'] += 1
-    
-    # Convert to rates - FIX: iterate over a copy of the keys
-    for key in list(retrieval_success.keys()):  # This is the fix - use list() to create a copy
-        retrieval_success[key + '_rate'] = retrieval_success[key] / total_samples if total_samples > 0 else 0
-    
-    similarity_metrics['retrieval_success_rates'] = retrieval_success
-    
-    return similarity_metrics
+    return results_by_mode, generated_embeddings, reference_embeddings
 
 
-def calculate_property_similarity(props1, props2):
-    """Calculate normalized similarity between molecular properties."""
-    if not props1 or not props2:
-        return 0.0
+def run_independent_evaluation(args):
+    """Run evaluation with three distinct modes: pure generation, conventional retrieval, and retrieval by generation."""
     
-    # Key properties for comparison with their typical ranges
-    property_ranges = {
-        'MW': 500,          # Molecular weight
-        'LogP': 10,         # Lipophilicity  
-        'TPSA': 200,        # Topological polar surface area
-        'HBA': 15,          # Hydrogen bond acceptors
-        'HBD': 10,          # Hydrogen bond donors
-        'RotBonds': 20,     # Rotatable bonds
-        'AromaticRings': 5, # Aromatic rings
-        'HeavyAtoms': 50,   # Heavy atom count
-        'QED': 1,           # Drug-likeness score
-        'BertzCT': 1000     # Complexity
-    }
+    logger.info("Setting up three-mode evaluation...")
     
-    similarities = []
+    # Set up device and seed
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(args.global_seed)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
     
-    for prop, range_val in property_ranges.items():
-        if prop in props1 and prop in props2:
-            val1 = props1[prop]
-            val2 = props2[prop]
+    logger.info(f"Using device: {device}, seed: {args.global_seed}")
+    
+    # Validate evaluation modes
+    if not any([args.run_generation, args.run_conventional_retrieval, args.run_retrieval_by_generation]):
+        logger.warning("No evaluation mode specified. Enabling conventional retrieval mode by default.")
+        args.run_conventional_retrieval = True
+    
+    # Load gene count matrix and set up data loaders (existing logic)
+    if args.gene_count_matrix_path is not None:
+        gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
+        logger.info(f"Loaded gene count matrix: {gene_count_matrix.shape}")
+    else:
+        gene_count_matrix = None
+    
+    # Set up data loader function based on dataset type
+    if args.dataset == "gdp":
+        create_data_loader = create_gdp_dataloaders
+    elif args.dataset == "lincs_rna":
+        create_data_loader = create_lincs_rna_dataloaders
+        if gene_count_matrix is not None:
+            gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "cpgjump":
+        create_data_loader = create_cpgjump_dataloaders
+    elif args.dataset == "tahoe":
+        create_data_loader = create_tahoe_dataloaders
+        if gene_count_matrix is not None:
+            gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "other":
+        if args.transpose_gene_count_matrix and gene_count_matrix is not None:
+            logger.info("Transposing gene count matrix as per --transpose-gene-count-matrix flag.")
+            gene_count_matrix = gene_count_matrix.T
+        create_data_loader = create_leak_free_dataloaders
+        if args.stratify_by is None:
+            args.stratify_by = [args.compound_name_label]
+            if args.cell_type_label is not None:
+                args.stratify_by.append(args.cell_type_label)
+        logger.info(f"Stratifying train/test split by {args.stratify_by}")
+    else:
+        raise ValueError(f"Unknown dataset {args.dataset}.")
+    
+    # Load metadata if provided
+    metadata_control = metadata_drug = None
+    if args.metadata_control_path is not None:
+        metadata_control = pd.read_csv(args.metadata_control_path)
+    if args.metadata_drug_path is not None:
+        metadata_drug = pd.read_csv(args.metadata_drug_path)
+    
+    # Create data loaders
+    train_loader, test_loader = create_data_loader(
+        metadata_control=metadata_control,
+        metadata_drug=metadata_drug, 
+        gene_count_matrix=gene_count_matrix,
+        image_json_path=args.image_json_path,
+        drug_data_path=args.drug_data_path,
+        raw_drug_csv_path=args.raw_drug_csv_path,
+        batch_size=args.batch_size,
+        shuffle=True,
+        shuffle_test=True,
+        compound_name_label=args.compound_name_label,
+        exclude_cell_lines=args.exclude_cell_lines,
+        exclude_drugs=args.exclude_drugs,
+        debug_mode=args.debug_mode,
+        debug_samples=args.debug_samples,
+        include_cell_lines=args.include_cell_lines,
+        include_drugs=args.include_drugs,
+        random_state=args.random_state,
+        split_train_test=True,
+        test_size=args.test_size,
+        return_datasets=False,
+    )
+    
+    eval_loader = test_loader
+    total_test_batches = len(eval_loader)
+    
+    # Calculate evaluation scope
+    if args.eval_portion < 1.0:
+        eval_batches = max(1, int(total_test_batches * args.eval_portion))
+        logger.info(f"Evaluating {args.eval_portion*100:.1f}% of test data: {eval_batches}/{total_test_batches} batches")
+    else:
+        eval_batches = min(args.max_eval_batches, total_test_batches) if args.max_eval_batches > 0 else total_test_batches
+        logger.info(f"Evaluating {eval_batches}/{total_test_batches} batches")
+    
+    # Load models if needed
+    model = image_encoder = rna_encoder = ae_model = flow = None
+    
+    if args.run_generation or args.run_retrieval_by_generation or args.run_conventional_retrieval:
+        logger.info("Loading models for evaluation...")
+        
+        # Create ReT model (needed for generation and retrieval by generation)
+        if args.run_generation or args.run_retrieval_by_generation:
+            latent_size = 127
+            in_channels = 64
+            cross_attn = 192
+            condition_dim = 192
             
-            if range_val > 0:
-                # Normalized absolute difference
-                normalized_diff = abs(val1 - val2) / range_val
-                # Convert to similarity (1 - difference, capped at 0)
-                similarity = max(0, 1 - normalized_diff)
-                similarities.append(similarity)
+            try:
+                model = ReT_SRA_models[args.model](
+                    input_size=latent_size,
+                    in_channels=in_channels,
+                    cross_attn=cross_attn,
+                    condition_dim=condition_dim
+                ).to(device)
+                logger.info(f"Using SRA model: {args.model}")
+            except KeyError:
+                model = ReT_models[args.model](
+                    input_size=latent_size,
+                    in_channels=in_channels,
+                    cross_attn=cross_attn,
+                    condition_dim=condition_dim
+                ).to(device)
+                logger.info(f"Using standard model: {args.model}")
+            
+            # Load checkpoint
+            checkpoint = torch.load(args.ckpt, map_location='cpu')
+            model.load_state_dict(checkpoint['model'], strict=False)
+            model.eval()
+            logger.info(f"Loaded ReT model from {args.ckpt}")
+        else:
+            # For conventional retrieval only, we still need encoders
+            checkpoint = torch.load(args.ckpt, map_location='cpu')
+        
+        # Setup encoders (needed for all modes that use biological features)
+        image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
+        image_encoder.load_state_dict(checkpoint['image_encoder'], strict=True)
+        image_encoder.eval()
+        
+        # Setup RNA encoder
+        if args.paired_rna_encoder:
+            rna_encoder = PairedRNAEncoder(
+                input_dim=gene_count_matrix.shape[0] if gene_count_matrix is not None else 2000, 
+                output_dim=128, 
+                dropout=0.1, 
+                num_heads=4, 
+                gene_embed_dim=512, 
+                num_self_attention_layers=1, 
+                num_cross_attention_layers=2,
+                use_bidirectional_cross_attn=True
+            ).to(device)
+        else:
+            rna_encoder = RNAEncoder(
+                input_dim=gene_count_matrix.shape[0] if gene_count_matrix is not None else 2000,
+                output_dim=64,
+                dropout=0.1
+            ).to(device)
+        
+        rna_encoder.load_state_dict(checkpoint['rna_encoder'], strict=True) 
+        rna_encoder.eval()
+        
+        # Setup autoencoder (needed for generation and retrieval by generation)
+        if args.run_generation or args.run_retrieval_by_generation:
+            ae_config = {
+                'bert_config_decoder': './config_decoder.json',
+                'bert_config_encoder': './config_encoder.json',
+                'embed_dim': 256,
+            }
+            tokenizer = regexTokenizer(vocab_path='./dataloaders/vocab_bpe_300_sc.txt', max_len=127)
+            ae_model = pert2mol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer, use_linear=True)
+            
+            if args.vae:
+                ae_checkpoint = torch.load(args.vae, map_location='cpu')
+                try:
+                    ae_state_dict = ae_checkpoint['model']
+                except:
+                    ae_state_dict = ae_checkpoint['state_dict']
+                ae_model.load_state_dict(ae_state_dict, strict=False)
+            
+            for param in ae_model.parameters():
+                param.requires_grad = False
+            ae_model = ae_model.to(device)
+            ae_model.eval()
+            
+            # Setup rectified flow for generation
+            if args.run_generation:
+                flow = create_rectified_flow(num_timesteps=1000)
+        
+        logger.info("Models loaded successfully")
     
-    return np.mean(similarities) if similarities else 0.0
-
-
-def calculate_multi_criteria_similarity(fp_similarities, scaffold_sim, property_sim):
-    """Calculate weighted multi-criteria similarity score."""
-    # Weights for different similarity components
-    weights = {
-        'morgan_r2': 0.25,      # Most important fingerprint
-        'morgan_r3': 0.15,      # Secondary fingerprint
-        'maccs': 0.15,          # MACCS keys
-        'scaffold': 0.25,       # Scaffold similarity
-        'property': 0.20        # Property similarity
-    }
+    # Collect training data based on enabled modes
+    training_data = {'smiles': [], 'compound_names': []}
     
-    score = 0.0
-    
-    # Fingerprint similarities
-    score += fp_similarities.get('morgan_r2', 0) * weights['morgan_r2']
-    score += fp_similarities.get('morgan_r3', 0) * weights['morgan_r3']
-    score += fp_similarities.get('maccs', 0) * weights['maccs']
-    
-    # Scaffold and property similarities
-    score += scaffold_sim * weights['scaffold']
-    score += property_sim * weights['property']
-    
-    return score
-
-
-def calculate_drug_likeness_score(props):
-    """Calculate comprehensive drug-likeness score."""
-    if not props:
-        return 0.0
-    
-    score = 0
-    
-    # QED (Quantitative Estimate of Drug-likeness)
-    score += props['QED'] * 0.25
-    
-    # Lipinski compliance
-    score += (4 - props['Lipinski_violations']) / 4 * 0.20
-    
-    # Veber compliance
-    score += (2 - props['Veber_violations']) / 2 * 0.15
-    
-    # Molecular complexity (moderate is better)
-    complexity_score = 1 - abs(props['BertzCT'] - 400) / 400  # Normalize around 400
-    score += max(0, complexity_score) * 0.15
-    
-    # Size appropriateness
-    mw_score = 1 - abs(props['MW'] - 350) / 350  # Target around 350 Da
-    score += max(0, mw_score) * 0.10
-    
-    # Fraction Csp3 (3D character)
-    score += min(props['FractionCsp3'], 0.5) * 2 * 0.10  # Target ~0.25-0.5
-    
-    # TPSA appropriateness
-    tpsa_score = 1 - abs(props['TPSA'] - 80) / 140  # Target around 60-100
-    score += max(0, tpsa_score) * 0.05
-    
-    return score
-
-
-def diversity_analysis(smiles_list):
-    """Diversity analysis with multiple metrics."""
-    if len(smiles_list) < 2:
-        return {
-            'internal_diversity': 0.0,
-            'scaffold_diversity': 0.0,
-            'property_diversity': 0.0,
-            'num_unique_scaffolds': 0
-        }
-    
-    # Fingerprint-based diversity
-    fingerprints = []
-    scaffolds = []
-    properties = []
-    
-    for smi in smiles_list:
-        try:
-            mol = Chem.MolFromSmiles(smi)
-            if mol is not None:
-                # Fingerprints
-                fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, 2)
-                fingerprints.append(fp)
-                
-                # Scaffolds
-                scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-                scaffold_smiles = Chem.MolToSmiles(scaffold) if scaffold else ""
-                scaffolds.append(scaffold_smiles)
-                
-                # Properties for property-based diversity
-                props = calculate_comprehensive_molecular_properties(smi)
-                if props:
-                    prop_vector = [props['MW'], props['LogP'], props['TPSA'], props['QED']]
-                    properties.append(prop_vector)
-        except:
-            continue
-    
-    results = {}
-    
-    # Fingerprint diversity
-    if len(fingerprints) >= 2:
-        similarities = []
-        for i in range(len(fingerprints)):
-            for j in range(i + 1, len(fingerprints)):
-                sim = DataStructs.TanimotoSimilarity(fingerprints[i], fingerprints[j])
-                similarities.append(sim)
-        results['internal_diversity'] = 1.0 - np.mean(similarities)
+    # Priority: conventional retrieval needs biological features, others need drug lists
+    if args.run_conventional_retrieval:
+        # Need biological features for conventional retrieval
+        training_data = collect_training_data_with_biological_features(
+            args, train_loader, image_encoder, rna_encoder, device,
+            max_batches=args.max_training_batches
+        )
+    elif args.run_retrieval_by_generation:
+        # MUST use comprehensive drug list from CSV for retrieval by generation
+        if args.raw_drug_csv_path and os.path.exists(args.raw_drug_csv_path):
+            training_drugs_from_csv = collect_all_drugs_from_csv(
+                args.raw_drug_csv_path, 
+                compound_name_label=args.compound_name_label,
+                smiles_label='canonical_smiles'
+            )
+            training_data = {
+                'smiles': training_drugs_from_csv['smiles'],
+                'compound_names': training_drugs_from_csv['compound_names']
+            }
+            logger.info(f"Loaded {len(training_data['compound_names'])} unique compounds for retrieval by generation")
+        else:
+            raise ValueError("--raw-drug-csv-path is required for retrieval by generation mode")
     else:
-        results['internal_diversity'] = 0.0
+        # Minimal data collection for generation mode only
+        logger.info("Collecting minimal training data for novelty evaluation...")
+        max_training_batches = 20 if args.debug_mode else 50
+        
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Collecting training SMILES")):
+            training_data['smiles'].extend(batch['target_smiles'])
+            if batch_idx >= max_training_batches:
+                break
     
-    # Scaffold diversity
-    unique_scaffolds = len(set(scaffolds))
-    results['scaffold_diversity'] = unique_scaffolds / len(smiles_list)
-    results['num_unique_scaffolds'] = unique_scaffolds
+    # Run three-mode evaluation on test data
+    all_results_by_mode = {'pure_generation': [], 'conventional_retrieval': [], 'retrieval_by_generation': []}
     
-    # Property-based diversity
-    if len(properties) >= 2:
-        prop_matrix = np.array(properties)
-        # Normalize properties
-        scaler = StandardScaler()
-        prop_matrix_norm = scaler.fit_transform(prop_matrix)
-        distances = euclidean_distances(prop_matrix_norm)
-        # Get upper triangle (excluding diagonal)
-        upper_triangle = distances[np.triu_indices_from(distances, k=1)]
-        results['property_diversity'] = np.mean(upper_triangle)
-    else:
-        results['property_diversity'] = 0.0
+    # For retrieval by generation: collect embeddings and metadata
+    all_generated_embeddings = []
+    all_sample_metadata = []
+    reference_drug_embeddings = None
     
-    return results
-
-
-def analyze_mechanism_consistency(compound_name, generated_smiles, target_smiles):
-    """Analyze if generated molecule is mechanistically consistent."""
-    compound_name_lower = compound_name.lower()
+    eval_start_time = time.time()
     
-    mechanism_classes = {
-        'steroid': ['steroid', 'cortisone', 'predni', 'hydrocortisone', 'dexamethasone', 'testosterone'],
-        'taxane': ['taxol', 'paclitaxel', 'docetaxel'],
-        'antibiotic': ['doxorubicin', 'mitomycin', 'bleomycin', 'streptomycin'],
-        'kinase_inhibitor': ['kinase', 'inhibitor', 'dasatinib', 'imatinib'],
-        'antimetabolite': ['methotrexate', '5-fluorouracil', 'cytarabine'],
-        'alkylating_agent': ['cyclophosphamide', 'cisplatin', 'carboplatin'],
-        'topoisomerase_inhibitor': ['etoposide', 'topotecan', 'irinotecan'],
-        'antimicrotubule': ['vincristine', 'vinblastine', 'colchicine']
-    }
+    logger.info(f"Starting three-mode evaluation on test data...")
+    logger.info(f"Modes enabled: Generation={args.run_generation}, Conventional Retrieval={args.run_conventional_retrieval}, Retrieval by Generation={args.run_retrieval_by_generation}")
     
-    predicted_mechanism = 'other'
-    for mechanism, keywords in mechanism_classes.items():
-        if any(keyword in compound_name_lower for keyword in keywords):
-            predicted_mechanism = mechanism
+    for batch_idx, batch in enumerate(tqdm(eval_loader, desc="Evaluating test data")):
+        if batch_idx >= eval_batches:
             break
-    
-    def get_structural_features(smiles):
-        try:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                return {}
-            
-            features = {
-                'has_steroid_like': False,
-                'num_rings': mol.GetRingInfo().NumRings(),
-                'aromatic_rings': Descriptors.NumAromaticRings(mol),
-                'has_heterocycles': any(atom.GetAtomicNum() not in [1, 6] for atom in mol.GetAtoms() if atom.IsInRing()),
-                'molecular_flexibility': Descriptors.NumRotatableBonds(mol),
-                'polar_surface_area': Descriptors.TPSA(mol)
-            }
-            
-            # Simple steroid-like pattern detection (4 fused rings)
-            if features['num_rings'] >= 4 and features['aromatic_rings'] <= 1:
-                features['has_steroid_like'] = True
-            
-            return features
-        except:
-            return {}
-    
-    target_features = get_structural_features(target_smiles)
-    generated_features = get_structural_features(generated_smiles)
-    
-    # Calculate feature consistency
-    consistency_score = 0.0
-    if target_features and generated_features:
-        # Ring consistency
-        ring_diff = abs(target_features['num_rings'] - generated_features['num_rings'])
-        ring_consistency = max(0, 1 - ring_diff / 5)
         
-        # Aromatic ring consistency
-        aromatic_diff = abs(target_features['aromatic_rings'] - generated_features['aromatic_rings'])
-        aromatic_consistency = max(0, 1 - aromatic_diff / 3)
+        # Encode biological features
+        with torch.no_grad():
+            y_features, pad_mask = dual_rna_image_encoder(
+                batch['control_images'], batch['treatment_images'], 
+                batch['control_transcriptomics'], batch['treatment_transcriptomics'],
+                image_encoder, rna_encoder, device
+            )
         
-        # Steroid-like consistency
-        steroid_consistency = 1.0 if target_features['has_steroid_like'] == generated_features['has_steroid_like'] else 0.0
+        # Run multi-mode evaluation for this batch
+        batch_results, generated_embeddings, reference_embeddings = run_three_mode_evaluation(
+            batch, training_data, model, flow, ae_model, 
+            image_encoder, rna_encoder, y_features, pad_mask, device, args
+        )
         
-        consistency_score = (ring_consistency + aromatic_consistency + steroid_consistency) / 3
+        # Store reference drug embeddings (only need to do this once)
+        if args.run_retrieval_by_generation and reference_drug_embeddings is None and reference_embeddings is not None:
+            reference_drug_embeddings = reference_embeddings
+        
+        # Accumulate generated embeddings for retrieval by generation
+        if args.run_retrieval_by_generation and generated_embeddings is not None:
+            all_generated_embeddings.append(generated_embeddings)
+        
+        # Accumulate results
+        for mode, results in batch_results.items():
+            all_results_by_mode[mode].extend(results)
+        
+        # Collect sample metadata for retrieval by generation mode
+        if args.run_retrieval_by_generation:
+            for i in range(len(batch['target_smiles'])):
+                sample_metadata = {
+                    'batch_idx': batch_idx,
+                    'sample_idx_in_batch': i,
+                    'target_smiles': batch['target_smiles'][i],
+                    'compound_name': batch['compound_name'][i],
+                    'global_sample_idx': len(all_sample_metadata)
+                }
+                # Add any other batch fields you want to preserve
+                for key in batch.keys():
+                    if key not in ['control_images', 'treatment_images', 'control_transcriptomics', 'treatment_transcriptomics']:
+                        if isinstance(batch[key], list) and i < len(batch[key]):
+                            sample_metadata[key] = batch[key][i]
+                
+                all_sample_metadata.append(sample_metadata)
+    
+    eval_time = time.time() - eval_start_time
+    logger.info(f"Evaluation completed in {eval_time:.1f}s")
+    
+    # Calculate mode-specific metrics
+    mode_metrics = calculate_mode_specific_metrics(all_results_by_mode, training_data)
+    
+    # Save embeddings and metadata for retrieval by generation mode
+    if args.run_retrieval_by_generation:
+        # Concatenate all generated embeddings
+        if all_generated_embeddings:
+            all_generated_embeddings_matrix = np.vstack(all_generated_embeddings)
+            
+            # Save generated drug embeddings (one row per test sample)
+            embeddings_path = os.path.join(args.output_dir, f"{args.output_prefix}_generated_embeddings.npy")
+            np.save(embeddings_path, all_generated_embeddings_matrix)
+            logger.info(f"Saved generated drug embeddings: {embeddings_path} (shape: {all_generated_embeddings_matrix.shape})")
+        
+        # Save reference drug embeddings (one row per reference drug, in CSV order)
+        if reference_drug_embeddings is not None:
+            reference_embeddings_path = os.path.join(args.output_dir, f"{args.output_prefix}_reference_embeddings.npy")
+            np.save(reference_embeddings_path, reference_drug_embeddings)
+            logger.info(f"Saved reference drug embeddings: {reference_embeddings_path} (shape: {reference_drug_embeddings.shape})")
+        
+        # Save sample metadata (in corresponding order to generated embeddings)
+        if all_sample_metadata:
+            metadata_df = pd.DataFrame(all_sample_metadata)
+            metadata_path = os.path.join(args.output_dir, f"{args.output_prefix}_sample_metadata.csv")
+            metadata_df.to_csv(metadata_path, index=False)
+            logger.info(f"Saved sample metadata: {metadata_path} ({len(metadata_df)} samples)")
+        
+        # Save reference drug metadata (in corresponding order to reference embeddings)
+        if training_data.get('smiles') and training_data.get('compound_names'):
+            reference_metadata = pd.DataFrame({
+                'smiles': training_data['smiles'],
+                'compound_name': training_data['compound_names'],
+                'reference_drug_idx': range(len(training_data['smiles']))
+            })
+            reference_metadata_path = os.path.join(args.output_dir, f"{args.output_prefix}_reference_metadata.csv")
+            reference_metadata.to_csv(reference_metadata_path, index=False)
+            logger.info(f"Saved reference drug metadata: {reference_metadata_path} ({len(reference_metadata)} drugs)")
+    
+    # Create metadata
+    metadata = {
+        'evaluation_mode': 'three_mode_comprehensive',
+        'modes_enabled': {
+            'pure_generation': args.run_generation,
+            'conventional_retrieval': args.run_conventional_retrieval,
+            'retrieval_by_generation': args.run_retrieval_by_generation
+        },
+        'dataset': args.dataset,
+        'retrieval_top_k': args.retrieval_top_k,
+        'retrieval_by_generation_top_k': args.retrieval_by_generation_top_k if args.run_retrieval_by_generation else None,
+        'eval_portion': args.eval_portion,
+        'max_eval_batches': args.max_eval_batches,
+        'total_test_batches': total_test_batches,
+        'evaluated_batches': eval_batches,
+        'global_seed': args.global_seed,
+        'random_state': args.random_state,
+        'evaluation_time': eval_time,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'embedding_files': {
+            'generated_embeddings': f"{args.output_prefix}_generated_embeddings.npy" if args.run_retrieval_by_generation else None,
+            'reference_embeddings': f"{args.output_prefix}_reference_embeddings.npy" if args.run_retrieval_by_generation else None,
+            'sample_metadata': f"{args.output_prefix}_sample_metadata.csv" if args.run_retrieval_by_generation else None,
+            'reference_metadata': f"{args.output_prefix}_reference_metadata.csv" if args.run_retrieval_by_generation else None
+        }
+    }
     
     return {
-        'predicted_mechanism': predicted_mechanism,
-        'target_features': target_features,
-        'generated_features': generated_features,
-        'mechanism_consistency_score': consistency_score
+        'metadata': metadata,
+        'training_data': training_data,
+        'results_by_mode': all_results_by_mode,
+        'mode_metrics': mode_metrics
     }
 
 
-def create_evaluation_plots(results, output_dir="./plots"):
-    """Create comprehensive evaluation plots."""
-    import os
-    os.makedirs(output_dir, exist_ok=True)
+def collect_training_data_with_biological_features(args, train_loader, image_encoder, rna_encoder, device, 
+    max_batches=50):
+    """Collect training data with biological features for conventional retrieval"""
     
-    valid_results = [r for r in results if r.get('is_valid', False)]
-    if not valid_results:
-        print("No valid results to plot")
-        return
+    training_data = {
+        'smiles': [],
+        'compound_names': [],
+        'biological_features': []
+    }
     
-    # 1. Confidence distribution by method
-    plt.figure(figsize=(12, 8))
-    methods = list(set(r.get('method', 'unknown') for r in valid_results))
+    logger.info("Collecting training data with biological features...")
     
-    for i, method in enumerate(methods):
-        method_results = [r for r in valid_results if r.get('method') == method]
-        confidences = [r.get('confidence', 0) for r in method_results]
-        
-        plt.subplot(2, 2, i+1)
-        plt.hist(confidences, bins=20, alpha=0.7, label=method)
-        plt.xlabel('Confidence Score')
-        plt.ylabel('Count')
-        plt.title(f'{method.title()} Confidence Distribution')
-        plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/confidence_distributions.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 2. Molecular properties distribution
-    properties = []
-    for r in valid_results:
-        if r.get('molecular_properties'):
-            properties.append(r['molecular_properties'])
-    
-    if properties:
-        prop_df = pd.DataFrame(properties)
-        
-        plt.figure(figsize=(15, 10))
-        key_props = ['MW', 'LogP', 'TPSA', 'QED', 'HBA', 'HBD', 'RotBonds', 'NumRings']
-        
-        for i, prop in enumerate(key_props):
-            if prop in prop_df.columns:
-                plt.subplot(2, 4, i+1)
-                plt.hist(prop_df[prop], bins=20, alpha=0.7)
-                plt.xlabel(prop)
-                plt.ylabel('Count')
-                plt.title(f'{prop} Distribution')
-        
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/molecular_properties.png", dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    # 3. Similarity analysis
-    similarities = []
-    for r in valid_results:
-        if r.get('similarity_analysis'):
-            similarities.append(r['similarity_analysis'])
-    
-    if similarities:
-        sim_df = pd.DataFrame(similarities)
-        
-        plt.figure(figsize=(12, 8))
-        sim_types = ['morgan_r2', 'maccs', 'rdk', 'scaffold_similarity']
-        
-        for i, sim_type in enumerate(sim_types):
-            if sim_type in sim_df.columns:
-                plt.subplot(2, 2, i+1)
-                plt.hist(sim_df[sim_type], bins=20, alpha=0.7)
-                plt.xlabel(f'{sim_type.title()} Similarity')
-                plt.ylabel('Count')
-                plt.title(f'{sim_type.title()} Distribution')
-        
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/similarity_analysis.png", dpi=300, bbox_inches='tight')
-        plt.close()
+    if max_batches <= 0:
+        max_batches = len(train_loader)
+        logger.info(f"max_batches <= 0, using all {max_batches} batches from training data")
 
+    for batch_idx, batch in enumerate(tqdm(train_loader, desc="Collecting training data")):
+        if batch_idx >= max_batches:
+            break
+            
+        control_imgs = batch['control_images']
+        treatment_imgs = batch['treatment_images']
+        control_rna = batch['control_transcriptomics']
+        treatment_rna = batch['treatment_transcriptomics']
+        target_smiles = batch['target_smiles']
+        compound_names = batch['compound_name']
+        
+        # Encode biological features
+        with torch.no_grad():
+            y_features, pad_mask = dual_rna_image_encoder(
+                control_imgs, treatment_imgs, control_rna, treatment_rna,
+                image_encoder, rna_encoder, device
+            )
+        
+        # Store data
+        training_data['smiles'].extend(target_smiles)
+        training_data['compound_names'].extend(compound_names)
+        training_data['biological_features'].append(y_features.cpu())
+    
+    logger.info(f"Collected {len(training_data['smiles'])} training samples with biological features")
+    return training_data
 
+        
 def main():
-    parser = argparse.ArgumentParser(description="Comprehensive evaluation of generated molecules")
-    parser.add_argument("--input-file", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/generated_molecules_retrieval_42.json",
-                       help="JSON file with generated molecules from inference.py")
-    parser.add_argument("--pubchem-fingerprints-path", type=str, default=None,
-                       help="Path to pre-computed PubChem fingerprints pickle file")
-    parser.add_argument("--reference-csv-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/drug/PubChem/GDP_compatible/drug_basic_info.csv",
-                       help="Path to reference dataset CSV with molecular data")
-    parser.add_argument("--reference-smiles-column", type=str, default="canonical_smiles",
-                       help="Column name containing SMILES in reference CSV")
-    parser.add_argument("--use-pubchem-novelty", action="store_true",
-                       help="Use PubChem dataset for novelty calculation (requires --pubchem-fingerprints-path)")
-    parser.add_argument("--use-reference-csv-novelty", action="store_true",
-                       help="Use reference CSV for novelty calculation (requires --reference-csv-path)")
-    parser.add_argument("--output-prefix", type=str, default="evaluation",
-                       help="Prefix for output files")
-    parser.add_argument("--create-plots", action="store_true",
-                       help="Create evaluation plots")
-    parser.add_argument("--verbose", action="store_true",
-                       help="Verbose output")
+    parser = argparse.ArgumentParser(description="Three-mode comprehensive evaluation of drug generation models")
+    
+    # Three evaluation modes
+    parser.add_argument("--run-generation", action="store_true", 
+                       help="Run pure generation mode")
+    parser.add_argument("--run-conventional-retrieval", action="store_true",
+                       help="Run conventional retrieval mode (biological similarity-based)")
+    parser.add_argument("--run-retrieval-by-generation", action="store_true",
+                       help="Run retrieval by generation mode (model-based drug mapping)")
+    
+    # Generation parameters
+    parser.add_argument("--generation-steps", type=int, default=50, 
+                       help="Number of diffusion steps for generation")
+    parser.add_argument("--num-samples-per-condition", type=int, default=3,
+                       help="Number of samples to generate per biological condition")
+    
+    # Retrieval parameters
+    parser.add_argument("--retrieval-top-k", type=int, default=5,
+                       help="Top-k drugs to retrieve for conventional retrieval evaluation")
+    parser.add_argument("--retrieval-by-generation-top-k", type=int, default=20,
+                       help="Top-k drugs to retrieve for retrieval by generation evaluation")
+    
+    # Evaluation scope
+    parser.add_argument("--eval-portion", type=float, default=1.0,
+                       help="Portion of test data to evaluate (0.0-1.0)")
+    parser.add_argument("--max-eval-batches", type=int, default=0,
+                       help="Maximum number of batches to evaluate (0 = no limit)")
+    
+    # Model and checkpoint arguments
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()) + list(ReT_SRA_models.keys()), 
+                       default="pert2mol", help="Model architecture")
+    parser.add_argument("--ckpt", type=str, default=None,
+                       help="Path to model checkpoint (required for generation/retrieval-by-generation)")
+    parser.add_argument("--vae", type=str, 
+                       default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt",
+                       help="Path to autoencoder checkpoint")
+    
+    # Dataset arguments
+    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "cpgjump", "tahoe", "other"], default="gdp")
+    parser.add_argument("--image-json-path", type=str, default=None)
+    parser.add_argument("--drug-data-path", type=str, default=None)
+    parser.add_argument("--raw-drug-csv-path", type=str, default=None)
+    parser.add_argument("--metadata-control-path", type=str, default=None)
+    parser.add_argument("--metadata-drug-path", type=str, default=None)
+    parser.add_argument("--gene-count-matrix-path", type=str, default=None)
+    parser.add_argument("--compound-name-label", type=str, default="compound")
+    parser.add_argument("--cell-type-label", type=str, default="cell_line")
+    parser.add_argument("--stratify-by", type=str, nargs='+', default=None)
+    parser.add_argument("--transpose-gene-count-matrix", action="store_true", default=False)
+    parser.add_argument("--paired-rna-encoder", action="store_true")
+    parser.add_argument("--test-size", type=float, default=0.2)
+
+    # Data filtering arguments
+    parser.add_argument("--exclude-cell-lines", type=str, nargs='+', default=None)
+    parser.add_argument("--exclude-drugs", type=str, nargs='+', default=None)
+    parser.add_argument("--include-cell-lines", type=str, nargs='+', default=None)
+    parser.add_argument("--include-drugs", type=str, nargs='+', default=None)
+
+    parser.add_argument("--debug-mode", action="store_true", default=False)
+    parser.add_argument("--debug-samples", type=int, default=100)
+    
+    # Generation parameters
+    parser.add_argument("--max-training-batches", type=int, default=50, 
+                       help="Maximum number of training batches to use for collecting training data")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--global-seed", type=int, default=42)
+    
+    # Output arguments
+    parser.add_argument("--output-prefix", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default="./evaluation_results")
+    parser.add_argument("--verbose", action="store_true")
     
     args = parser.parse_args()
     
-    print(f"Loading generated molecules from {args.input_file}...")
+    # Validate that at least one mode is enabled
+    if not any([args.run_generation, args.run_conventional_retrieval, args.run_retrieval_by_generation]):
+        logger.warning("No evaluation mode specified. Enabling conventional retrieval mode by default.")
+        args.run_conventional_retrieval = True
     
-    # Load generated molecules
-    with open(args.input_file, 'r') as f:
-        data = json.load(f)
-    
-    print("Standardizing training data SMILES...")
-    data["training_data"]["smiles"] = standardize_smiles_batch_with_stats(data["training_data"]["smiles"])
-    for i, result in enumerate(data["results"]):
-        converted_smiles = standardize_smiles_single(result["generated_smiles"])
-        # print(f"{result['generated_smiles']==converted_smiles}; before: {result['generated_smiles']}, after:{converted_smiles}")
-        data["results"][i]["generated_smiles"] = converted_smiles
+    # Validate checkpoint requirement
+    if any([args.run_generation, args.run_retrieval_by_generation, args.run_conventional_retrieval]) and args.ckpt is None:
+        raise ValueError("Must specify --ckpt when using any evaluation mode (all modes require trained encoders)")
+  
+    # Create output directory
+    if args.output_prefix is not None:
+        args.output_dir = os.path.join(args.output_dir, args.output_prefix)
 
-     # Extract metadata and results
-    metadata = data['metadata']
-    training_data = data.get('training_data', {'smiles': []})
-    results = data['results']
-    
-    print(f"Loaded {len(results)} generated molecules")
-    print(f"Generation method: {metadata['inference_mode']}")
-    print(f"Valid molecules: {metadata['valid_molecules']}/{metadata['total_samples']}")
-    
-    # Initialize evaluator
-    evaluator = ComprehensiveMolecularEvaluator(
-        training_smiles=training_data['smiles'],
-        pubchem_fingerprints_path=args.pubchem_fingerprints_path,
-        reference_csv_path=args.reference_csv_path,
-        reference_smiles_column=args.reference_smiles_column
-    )
-    
-    # Process each result
-    print("Calculating comprehensive molecular evaluations...")
-    
-    valid_results = [r for r in results if r.get('is_valid', False)]
-    
-    start_time = time.time()
-    
-    for i, result in enumerate(tqdm(valid_results, desc="Evaluating molecules")):
-        target_smiles = result['target_smiles']
-        generated_smiles = result['generated_smiles']
-        compound_name = result['compound_name']
-        
-        # Multi-fingerprint similarity analysis
-        similarity_analysis = evaluator.calculate_multi_fingerprint_similarity(
-            target_smiles, generated_smiles
-        )
-        similarity_analysis['scaffold_similarity'] = evaluator.calculate_scaffold_similarity(
-            target_smiles, generated_smiles
-        )
-        result['similarity_analysis'] = similarity_analysis
-        
-        # Novelty analysis
-        use_pubchem = args.use_pubchem_novelty and evaluator.pubchem_fingerprints is not None
-        use_reference_csv = args.use_reference_csv_novelty and evaluator.reference_smiles
-        
-        novelty_score, novelty_method = evaluator.calculate_novelty_score(
-            generated_smiles, 
-            use_pubchem=use_pubchem,
-            use_reference_csv=use_reference_csv
-        )
-        result['novelty_score'] = novelty_score
-        result['novelty_method'] = novelty_method
-        
-        # Molecular properties
-        props = calculate_comprehensive_molecular_properties(generated_smiles)
-        result['molecular_properties'] = props
-        
-        # Drug-likeness score
-        result['druglikeness_score'] = calculate_drug_likeness_score(props)
-        
-        # Mechanism consistency
-        result['mechanism_analysis'] = analyze_mechanism_consistency(
-            compound_name, generated_smiles, target_smiles
-        )
-        
-        if args.verbose and i < 5:
-            print(f"\nExample {i+1}:")
-            print(f"  Target: {target_smiles}")
-            print(f"  Generated: {generated_smiles}")
-            print(f"  Morgan similarity: {similarity_analysis.get('morgan_r2', 0):.3f}")
-            print(f"  Novelty: {result['novelty_score']:.3f}")
-            print(f"  Drug-likeness: {result['druglikeness_score']:.3f}")
-    
-    # Diversity analysis
-    all_generated_smiles = [r['generated_smiles'] for r in valid_results]
-    diversity_metrics = diversity_analysis(all_generated_smiles)
-    
-    # Comprehensive similarity analysis
-    comprehensive_similarity_metrics = calculate_comprehensive_similarity_metrics(valid_results)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    retrieval_metrics = calculate_retrieval_metrics(valid_results)
-    multi_candidate_metrics = calculate_multi_candidate_metrics(valid_results)
+    logger.info(f"Starting three-mode evaluation:")
+    logger.info(f"  Pure Generation: {args.run_generation}")
+    logger.info(f"  Conventional Retrieval: {args.run_conventional_retrieval}")
+    logger.info(f"  Retrieval by Generation: {args.run_retrieval_by_generation}")
 
-    # Calculate comprehensive statistics
-    evaluation_time = time.time() - start_time
+    if args.output_prefix == "evaluation":
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        args.output_prefix = f"{args.dataset}_{args.random_state}_{args.global_seed}_{timestamp}"
+
+    logger.info(f"Starting evaluation with settings:")
+    logger.info(f"  Dataset: {args.dataset}")
+    logger.info(f"  Eval portion: {args.eval_portion*100:.1f}%")
+    logger.info(f"  Max batches: {args.max_eval_batches if args.max_eval_batches > 0 else 'unlimited'}")
+    logger.info(f"  Retrieval Top-K: {args.retrieval_top_k}")
+    logger.info(f"  Generation steps: {args.generation_steps}")
+    logger.info(f"  Seed: {args.global_seed}")
+    logger.info(f"  Random state: {args.random_state}")
+    logger.info(f"  Output: {args.output_dir}")
     
-    # Method distribution
-    method_counts = Counter(r.get('method', 'unknown') for r in results)
-    
-    # Similarity statistics
-    similarity_stats = {}
-    for sim_type in ['morgan_r2', 'maccs', 'rdk', 'atom_pairs', 'scaffold_similarity']:
-        values = [r['similarity_analysis'].get(sim_type, 0) for r in valid_results 
-                 if 'similarity_analysis' in r]
-        if values:
-            similarity_stats[sim_type] = {
-                'mean': np.mean(values),
-                'std': np.std(values),
-                'min': np.min(values),
-                'max': np.max(values)
-            }
-    
-    # Novelty and drug-likeness statistics
-    novelty_scores = [r.get('novelty_score', 0) for r in valid_results]
-    novelty_methods = [r.get('novelty_method', 'unknown') for r in valid_results]
-    druglikeness_scores = [r.get('druglikeness_score', 0) for r in valid_results]
-    
-    # Count novelty methods used
-    novelty_method_counts = Counter(novelty_methods)
-    
-    novelty_stats = {
-        'mean': np.mean(novelty_scores),
-        'std': np.std(novelty_scores),
-        'min': np.min(novelty_scores),
-        'max': np.max(novelty_scores),
-        'method_counts': dict(novelty_method_counts)
-    } if novelty_scores else {}
-    
-    druglikeness_stats = {
-        'mean': np.mean(druglikeness_scores),
-        'std': np.std(druglikeness_scores),
-        'min': np.min(druglikeness_scores),
-        'max': np.max(druglikeness_scores)
-    } if druglikeness_scores else {}
-    
-    # Molecular property statistics
-    property_stats = {}
-    molecular_properties = [r.get('molecular_properties', {}) for r in valid_results]
-    molecular_properties = [p for p in molecular_properties if p]
-    
-    if molecular_properties:
-        extended_props = ['MW', 'LogP', 'HBA', 'HBD', 'TPSA', 'QED', 'BertzCT', 'NumRings']
-        for prop in extended_props:
-            values = [p.get(prop) for p in molecular_properties if p.get(prop) is not None]
-            if values:
-                property_stats[prop] = {
-                    'mean': np.mean(values),
-                    'std': np.std(values),
-                    'min': np.min(values),
-                    'max': np.max(values)
-                }
-    
-    # Mechanism consistency
-    mechanism_scores = [r['mechanism_analysis']['mechanism_consistency_score'] 
-                       for r in valid_results if r.get('mechanism_analysis')]
-    mechanism_stats = {
-        'mean': np.mean(mechanism_scores),
-        'std': np.std(mechanism_scores)
-    } if mechanism_scores else {}
-    
-    # Create comprehensive summary
-    comprehensive_summary = {
-        'evaluation_metadata': {
-            'input_file': args.input_file,
-            'evaluation_timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'evaluation_time_seconds': evaluation_time,
-            'pubchem_novelty_used': args.use_pubchem_novelty and evaluator.pubchem_fingerprints is not None,
-            'pubchem_fingerprints_count': len(evaluator.pubchem_fingerprints) if evaluator.pubchem_fingerprints else 0
-        },
-        'generation_metadata': metadata,
-        'evaluation_statistics': {
-            'total_samples': len(results),
-            'valid_molecules': len(valid_results),
-            'validity_rate': len(valid_results) / len(results) if results else 0,
-            'method_distribution': dict(method_counts)
-        },
-        'similarity_analysis': similarity_stats,
-        'comprehensive_similarity_metrics': comprehensive_similarity_metrics,  # Add this line
-        'novelty_analysis': {
-            'statistics': novelty_stats,
-            'primary_method': novelty_method_counts.most_common(1)[0][0] if novelty_method_counts else 'none',
-            'method_distribution': dict(novelty_method_counts) if novelty_method_counts else {},
-            'reference_datasets': {
-                'pubchem_available': evaluator.pubchem_fingerprints is not None,
-                'pubchem_count': len(evaluator.pubchem_fingerprints) if evaluator.pubchem_fingerprints else 0,
-                'reference_csv_available': bool(evaluator.reference_smiles),
-                'reference_csv_count': len(evaluator.reference_smiles),
-                'training_set_count': len(evaluator.training_smiles)
-            }
-        },
-        'druglikeness_analysis': druglikeness_stats,
-        'diversity_metrics': diversity_metrics,
-        'property_statistics': property_stats,
-        'mechanism_consistency': mechanism_stats,
-        'retrieval_metrics': retrieval_metrics,
-        'multi_candidate_metrics': multi_candidate_metrics,
-        'evaluated_results': valid_results,
-    }
+    # Run three-mode evaluation
+    comprehensive_data = run_independent_evaluation(args)
     
     # Save comprehensive results
-    output_json = f"{os.path.dirname(args.input_file)}/{args.output_prefix}_{metadata['inference_mode']}_{metadata['global_seed']}_comprehensive.json"
-    
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    output_json = os.path.join(args.output_dir, f"{args.output_prefix}_comprehensive.json")
+
     with open(output_json, 'w') as f:
-        json.dump(comprehensive_summary, f, indent=2, default=str)
+        json.dump(comprehensive_data, f, indent=2, default=str)
     
-    # Create human-readable summary
-    output_txt = f"{os.path.dirname(args.input_file)}/{args.output_prefix}_{metadata['inference_mode']}_{metadata['global_seed']}_summary.txt"
+    # Create three-section summary
+    summary_file = create_three_section_summary(comprehensive_data, args)
     
-    with open(output_txt, 'w') as f:
-        f.write("COMPREHENSIVE MOLECULAR EVALUATION REPORT\n")
-        f.write("=" * 60 + "\n\n")
-        
-        f.write(f"Input file: {args.input_file}\n")
-        f.write(f"Generation mode: {metadata['inference_mode']}\n")
-        f.write(f"Evaluation time: {evaluation_time:.1f}s\n\n")
-        
-        f.write("DATASET STATISTICS:\n")
-        f.write(f"  Total samples: {len(results)}\n")
-        f.write(f"  Valid molecules: {len(valid_results)} ({len(valid_results)/len(results)*100:.1f}%)\n\n")
-        
-        f.write("METHOD DISTRIBUTION:\n")
-        for method, count in method_counts.items():
-            f.write(f"  {method}: {count} ({count/len(results)*100:.1f}%)\n")
-        f.write("\n")
-        
-        f.write("SIMILARITY ANALYSIS:\n")
-        for sim_type, stats in similarity_stats.items():
-            f.write(f"  {sim_type.upper()}: {stats['mean']:.3f} ± {stats['std']:.3f}\n")
-        f.write("\n")
-        
-        f.write("NOVELTY ANALYSIS:\n")
-        if novelty_stats:
-            primary_method = novelty_stats.get('method_counts', {})
-            if primary_method:
-                most_common_method = max(primary_method.items(), key=lambda x: x[1])[0]
-                f.write(f"  Primary method: {most_common_method}\n")
-                f.write(f"  Method distribution:\n")
-                for method, count in primary_method.items():
-                    f.write(f"    {method}: {count} samples\n")
-            f.write(f"  Mean novelty: {novelty_stats['mean']:.3f} ± {novelty_stats['std']:.3f}\n")
-            f.write(f"  Range: {novelty_stats['min']:.3f} - {novelty_stats['max']:.3f}\n")
-            f.write(f"  Reference datasets:\n")
-            if evaluator.pubchem_fingerprints:
-                f.write(f"    PubChem: {len(evaluator.pubchem_fingerprints)} molecules\n")
-            if evaluator.reference_smiles:
-                f.write(f"    Reference CSV: {len(evaluator.reference_smiles)} molecules\n")
-            f.write(f"    Training set: {len(evaluator.training_smiles)} molecules\n")
-        f.write("\n")
-        
-        f.write("DRUG-LIKENESS ANALYSIS:\n")
-        if druglikeness_stats:
-            f.write(f"  Mean drug-likeness: {druglikeness_stats['mean']:.3f} ± {druglikeness_stats['std']:.3f}\n")
-            f.write(f"  Range: {druglikeness_stats['min']:.3f} - {druglikeness_stats['max']:.3f}\n\n")
-        
-        f.write("DIVERSITY METRICS:\n")
-        f.write(f"  Internal diversity: {diversity_metrics.get('internal_diversity', 0):.3f}\n")
-        f.write(f"  Scaffold diversity: {diversity_metrics.get('scaffold_diversity', 0):.3f}\n")
-        f.write(f"  Property diversity: {diversity_metrics.get('property_diversity', 0):.3f}\n")
-        f.write(f"  Unique scaffolds: {diversity_metrics.get('num_unique_scaffolds', 0)}\n\n")
-        
-        if retrieval_metrics and 'overall_retrieval_metrics' in retrieval_metrics:
-            f.write("RETRIEVAL PERFORMANCE:\n")
-            overall = retrieval_metrics['overall_retrieval_metrics']
-            f.write(f"  Exact match accuracy: {overall.get('exact_match_accuracy', 0):.3f}\n")
-            f.write(f"  Top-k hit rate: {overall.get('top_k_hit_rate', 0):.3f}\n")
-            f.write(f"  Exact matches: {overall.get('exact_matches', 0)}/{overall.get('total_samples', 0)}\n\n")
+    # Print final summary
+    metadata = comprehensive_data['metadata']
+    results_by_mode = comprehensive_data['results_by_mode']
+    mode_metrics = comprehensive_data['mode_metrics']
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("THREE-MODE EVALUATION COMPLETE")
+    logger.info(f"{'='*80}")
+    logger.info(f"Evaluation time: {metadata['evaluation_time']:.1f}s")
+    
+    # Report results for each enabled mode
+    for mode_name, display_name in [
+        ('pure_generation', 'Pure Generation'),
+        ('conventional_retrieval', 'Conventional Retrieval'), 
+        ('retrieval_by_generation', 'Retrieval by Generation')
+    ]:
+        if results_by_mode.get(mode_name):
+            results = results_by_mode[mode_name]
+            valid_count = sum(1 for r in results if r.get('is_valid'))
+            total_count = len(results)
+            logger.info(f"{display_name}: {valid_count}/{total_count} valid results")
             
-            # Threshold-based metrics
-            if 'threshold_based_metrics' in retrieval_metrics:
-                f.write("SIMILARITY-BASED CLASSIFICATION:\n")
-                for threshold_key, metrics in retrieval_metrics['threshold_based_metrics'].items():
-                    threshold = metrics['threshold']
-                    f.write(f"  Threshold {threshold}:\n")
-                    f.write(f"    Precision: {metrics['precision']:.3f}\n")
-                    f.write(f"    Recall: {metrics['recall']:.3f}\n")
-                    f.write(f"    F1-score: {metrics['f1_score']:.3f}\n")
-                    f.write(f"    Accuracy: {metrics['accuracy']:.3f}\n")
-                f.write("\n")
-        
-        if multi_candidate_metrics and multi_candidate_metrics.get('total_samples', 0) > 0:
-            f.write("MULTI-CANDIDATE ANALYSIS:\n")
-            f.write(f"  Hit rate @ top-1: {multi_candidate_metrics.get('hit_rate_top_1', 0):.3f}\n")
-            f.write(f"  Hit rate @ top-3: {multi_candidate_metrics.get('hit_rate_top_3', 0):.3f}\n")
-            f.write(f"  Hit rate @ top-5: {multi_candidate_metrics.get('hit_rate_top_5', 0):.3f}\n")
-            f.write(f"  Mean reciprocal rank: {multi_candidate_metrics.get('mean_reciprocal_rank', 0):.3f}\n")
-            f.write(f"  Average target rank: {multi_candidate_metrics.get('avg_target_rank', float('inf')):.1f}\n\n")
+            # Mode-specific metrics
+            if mode_name == 'pure_generation' and 'target_similarity' in mode_metrics.get(mode_name, {}):
+                sim = mode_metrics[mode_name]['target_similarity']['mean']
+                logger.info(f"  Mean target similarity: {sim:.3f}")
+            elif mode_name in ['conventional_retrieval', 'retrieval_by_generation'] and 'retrieval_accuracy' in mode_metrics.get(mode_name, {}):
+                acc = mode_metrics[mode_name]['retrieval_accuracy']['smiles_top_k_accuracy']
+                if mode_name == 'retrieval_by_generation':
+                    logger.info(f"  Top-{args.retrieval_by_generation_top_k} accuracy: {acc:.3f}")
+                else:
+                    logger.info(f"  Top-{args.retrieval_top_k} accuracy: {acc:.3f}")
 
-        if mechanism_stats:
-            f.write("MECHANISM CONSISTENCY:\n")
-            f.write(f"  Mean consistency: {mechanism_stats['mean']:.3f} ± {mechanism_stats['std']:.3f}\n\n")
-        
-        f.write("MOLECULAR PROPERTY STATISTICS:\n")
-        for prop, stats in property_stats.items():
-            f.write(f"  {prop}: {stats['mean']:.2f} ± {stats['std']:.2f}\n")
-    
-    # Create plots if requested
-    if args.create_plots:
-        print("Creating evaluation plots...")
-        create_evaluation_plots(valid_results)
-    
-    # Print summary
-    print(f"\n{'='*80}")
-    print("COMPREHENSIVE MOLECULAR EVALUATION COMPLETE")
-    print(f"{'='*80}")
-    print(f"Evaluated {len(valid_results)} valid molecules in {evaluation_time:.1f}s")
-    print(f"Results saved:")
-    print(f"  Comprehensive: {output_json}")
-    print(f"  Summary: {output_txt}")
-    if args.create_plots:
-        print(f"  Plots: ./plots/")
-    
-    if novelty_stats:
-        novelty_method = "PubChem" if args.use_pubchem_novelty and evaluator.pubchem_fingerprints else "training set"
-        print(f"\nKey Results:")
-        print(f"  Average novelty ({novelty_method}): {novelty_stats['mean']:.3f}")
-        print(f"  Average drug-likeness: {druglikeness_stats.get('mean', 0):.3f}")
-        print(f"  Internal diversity: {diversity_metrics.get('internal_diversity', 0):.3f}")
-
-    if retrieval_metrics and 'overall_retrieval_metrics' in retrieval_metrics:
-        overall = retrieval_metrics['overall_retrieval_metrics']
-        print(f"  Exact match accuracy: {overall.get('exact_match_accuracy', 0):.3f}")
-        print(f"  Top-k hit rate: {overall.get('top_k_hit_rate', 0):.3f}")
-        
-        # Show best F1 score across thresholds
-        if 'threshold_based_metrics' in retrieval_metrics:
-            best_f1 = 0
-            best_threshold = 0
-            for metrics in retrieval_metrics['threshold_based_metrics'].values():
-                if metrics['f1_score'] > best_f1:
-                    best_f1 = metrics['f1_score']
-                    best_threshold = metrics['threshold']
-            print(f"  Best F1-score: {best_f1:.3f} (threshold: {best_threshold})")
+    logger.info(f"\nResults saved:")
+    logger.info(f"  Comprehensive: {output_json}")
+    logger.info(f"  Three-section summary: {summary_file}")
 
 
 if __name__ == "__main__":
     main()
+

@@ -46,7 +46,7 @@ from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
 from dataloaders.dataset_cpgjump import create_cpgjump_dataloaders
 from dataloaders.dataset_tahoe import create_tahoe_dataloaders
 from dataloaders.download import download_model, find_model
-from diffusion.rectified_flow import create_rectified_flow
+from diffusion.gaussian_diffusion import GaussianDiffusion, get_named_beta_schedule, ModelMeanType, ModelVarType, LossType
 
 GRACEFUL_SHUTDOWN = False
 CHECKPOINT_DIR = None
@@ -78,6 +78,8 @@ def create_logger(logging_dir):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
+
+
 
 
 def create_dirs(args):
@@ -198,19 +200,27 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
             out_final = out_img + cfg_scale_image * (out_cond - out_img) 
         return out_final
     
-    # Custom sampling with CFG model
-    x = torch.randn(*shape, device=device)
-    dt = 1.0 / num_steps
+    # # Custom sampling with CFG model
+    # x = torch.randn(*shape, device=device)
+    # dt = 1.0 / num_steps
     
-    for i in range(num_steps):
-        t = torch.full((batch_size,), i * dt, device=device)
-        t_discrete = (t * 999).long()
+    # for i in range(num_steps):
+    #     t = torch.full((batch_size,), i * dt, device=device)
+    #     t_discrete = (t * 999).long()
         
-        with torch.no_grad():
-            velocity = cfg_model_fn(x, t_discrete)
-        x = x + dt * velocity
+    #     with torch.no_grad():
+    #         velocity = cfg_model_fn(x, t_discrete)
+    #     x = x + dt * velocity
     
-    return x
+    # return x
+    
+    # Use diffusion sampling
+    return flow.p_sample_loop(
+        cfg_model_fn, 
+        shape, 
+        device=device,
+        progress=False
+    )
 
 
 def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_encoder, device, use_ddp, rank, args, sra_teacher_manager=None, max_batches=100):
@@ -265,7 +275,7 @@ def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_e
                     if args.use_sra and sra_teacher_manager is not None:
                         try:
                             # Sample a timestep for SRA computation
-                            current_t = flow.sample_time(x.shape[0], device)
+                            current_t = torch.randint(0, flow.num_timesteps, (x.shape[0],), device=device)
                             
                             # Get student representation from current model
                             student_model = model.module if use_ddp else model
@@ -494,7 +504,14 @@ def main(args):
             if not use_ddp or rank == 0:
                 logger.info(f"SRA enabled: student_layer={args.sra_layer_student}, teacher_layer={args.sra_layer_teacher}, lambda={args.sra_lambda}")
             
-        flow = create_rectified_flow(num_timesteps=1000)
+        # Create diffusion instance
+        betas = get_named_beta_schedule("linear", num_diffusion_timesteps=1000)
+        flow = GaussianDiffusion(
+            betas=betas,
+            model_mean_type=ModelMeanType.EPSILON,  # Model predicts noise
+            model_var_type=ModelVarType.FIXED_SMALL,
+            loss_type=LossType.MSE
+        )
 
         # Load autoencoder (unchanged)
         ae_config = {
@@ -761,10 +778,8 @@ def main(args):
                 current_t = flow.sample_time(x.shape[0], device)
                 current_noise = torch.randn_like(x)
 
-                # Manual flow loss computation for full control
-                t_expanded = current_t.view(-1, 1, 1, 1)
-                x_t = (1 - t_expanded) * current_noise + t_expanded * x
-                true_velocity = x - current_noise
+                # Use diffusion training losses
+                current_t = torch.randint(0, flow.num_timesteps, (x.shape[0],), device=device)
 
                 # Forward pass for student (captures both output and SRA representation)
                 student_output, student_repr = student_model.forward(
@@ -778,8 +793,12 @@ def main(args):
                 else:
                     predicted_velocity = student_output
 
-                # Flow loss
-                flow_loss = F.mse_loss(predicted_velocity, true_velocity)
+                # Flow loss using diffusion
+                loss_dict = flow.training_losses(
+                    lambda x_input, t_input, **kwargs: student_model.forward(x_input, t_input, **kwargs)[0],
+                    x, t=current_t, model_kwargs=dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
+                )
+                flow_loss = loss_dict["loss"].mean()
 
                 # SRA loss computation using same timestep
                 sra_loss = torch.tensor(0.0, device=device)
@@ -1178,4 +1197,3 @@ if __name__ == "__main__":
         metadata_drug = pd.read_csv(args.metadata_drug_path)
 
     main(args)
-

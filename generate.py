@@ -2,6 +2,7 @@ import os
 import torch
 import torch.distributed as dist
 from models import ReT_models
+from models_sra import ReT_SRA_models
 from dataloaders.download import find_model
 from diffusion.rectified_flow import create_rectified_flow
 import argparse
@@ -10,16 +11,19 @@ import numpy as np
 import json
 import pickle
 from train_autoencoder import pert2mol_autoencoder
-from utils import AE_SMILES_decoder, regexTokenizer, dual_rna_image_encoder
-from encoders import ImageEncoder, RNAEncoder
-from dataloaders.dataset_gdp import create_raw_drug_dataloader
+from utils import AE_SMILES_decoder, regexTokenizer
+from encoders import ImageEncoder, RNAEncoder, PairedRNAEncoder
+from encoders import dual_rna_image_encoder_separate as dual_rna_image_encoder
+from dataloaders.dataset_gdp import create_gdp_dataloaders
+from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
+from dataloaders.dataset_cpgjump import create_cpgjump_dataloaders
+from dataloaders.dataset_tahoe import create_tahoe_dataloaders
+from dataloaders.dataloader import create_leak_free_dataloaders
 from rdkit import Chem
 import time
 from tqdm import tqdm
 import warnings
 from sklearn.metrics.pairwise import cosine_similarity
-from dataloaders.dataset_gdp import create_gdp_dataloaders
-from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
 warnings.filterwarnings('ignore')
 
 
@@ -52,7 +56,12 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
             pad_mask_batch = pad_mask.repeat(3, 1)
             x_batch = x.repeat(3, 1, 1, 1)
             
+            # Handle both ReT and ReT_SRA models
             velocity_batch = model(x_batch, t_discrete.repeat(3), y=y_batch, pad_mask=pad_mask_batch)
+            
+            # Handle tuple return from SRA models
+            if isinstance(velocity_batch, tuple):
+                velocity_batch = velocity_batch[0]
             
             if velocity_batch.shape[1] == 2 * x.shape[1]:
                 velocity_batch, _ = torch.split(velocity_batch, x.shape[1], dim=1)
@@ -114,6 +123,11 @@ def estimate_generation_confidence(model, flow, x_final, y_features, pad_mask, d
         t_final = torch.ones(x_final.shape[0], device=device)
         t_discrete = (t_final * 999).long()
         final_velocity = model(x_final, t_discrete, y=y_features, pad_mask=pad_mask)
+        
+        # Handle tuple return from SRA models
+        if isinstance(final_velocity, tuple):
+            final_velocity = final_velocity[0]
+            
         if final_velocity.shape[1] == 2 * x_final.shape[1]:
             final_velocity, _ = torch.split(final_velocity, x_final.shape[1], dim=1)
         
@@ -154,8 +168,7 @@ def basic_validity_check(smiles):
 
 @torch.no_grad()
 def main(args):
-    global create_data_loader
-    """Streamlined molecule generation with minimal evaluation."""
+    """Streamlined molecule generation with updated data loading."""
     torch.backends.cuda.matmul.allow_tf32 = True
     assert torch.cuda.is_available(), "Inference requires GPU"
     torch.set_grad_enabled(False)
@@ -168,22 +181,89 @@ def main(args):
     if args.ckpt is None:
         raise ValueError("Please specify checkpoint path with --ckpt")
 
-    # Create ReT model
+    # Load gene count matrix
+    if args.gene_count_matrix_path is not None:
+        gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
+    else:
+        gene_count_matrix = None
+
+    # Set up data loader function based on dataset type
+    if args.dataset == "gdp":
+        create_data_loader = create_gdp_dataloaders
+    elif args.dataset == "lincs_rna":
+        create_data_loader = create_lincs_rna_dataloaders
+        if gene_count_matrix is not None:
+            gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "cpgjump":
+        create_data_loader = create_cpgjump_dataloaders
+    elif args.dataset == "tahoe":
+        create_data_loader = create_tahoe_dataloaders
+        if gene_count_matrix is not None:
+            gene_count_matrix = gene_count_matrix.T
+    elif args.dataset == "other":
+        # Validate paths for custom dataset
+        for path_arg in ["image_json_path", "gene_count_matrix_path"]:
+            if args.__dict__.get(path_arg) is not None:
+                if not os.path.exists(args.__dict__[path_arg]):
+                    print(f"Warning: Cannot find {args.__dict__[path_arg]}. Setting to None.")
+                    args.__dict__[path_arg] = None
+        
+        if args.image_json_path is None and args.gene_count_matrix_path is None:
+            raise ValueError("At least one of image_json_path or gene_count_matrix_path must be provided for 'other' dataset")
+        
+        if args.transpose_gene_count_matrix and gene_count_matrix is not None:
+            print("Transposing gene count matrix as per --transpose-gene-count-matrix flag.")
+            gene_count_matrix = gene_count_matrix.T
+        
+        create_data_loader = create_leak_free_dataloaders
+
+        # Set up stratification for custom dataset
+        if args.stratify_by is None:
+            args.stratify_by = [args.compound_name_label]
+            if args.cell_type_label is not None:
+                args.stratify_by.append(args.cell_type_label)
+        
+        print(f"Stratifying train/test split by {args.stratify_by}")
+    else:
+        raise ValueError(f"Unknown dataset {args.dataset}.")
+
+    print(f"Using data loader: {create_data_loader}")
+
+    # Load metadata if provided
+    metadata_control = metadata_drug = None
+    if args.metadata_control_path is not None:
+        metadata_control = pd.read_csv(args.metadata_control_path)
+    
+    if args.metadata_drug_path is not None:
+        metadata_drug = pd.read_csv(args.metadata_drug_path)
+
+    # Create ReT model - handle both ReT and ReT_SRA models
     latent_size = 127
     in_channels = 64
     cross_attn = 192
     condition_dim = 192
     
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        in_channels=in_channels,
-        cross_attn=cross_attn,
-        condition_dim=condition_dim
-    ).to(device)
+    # Try ReT_SRA models first, then fall back to regular ReT models
+    try:
+        model = ReT_SRA_models[args.model](
+            input_size=latent_size,
+            in_channels=in_channels,
+            cross_attn=cross_attn,
+            condition_dim=condition_dim
+        ).to(device)
+        print(f"Using SRA model: {args.model}")
+    except KeyError:
+        model = ReT_models[args.model](
+            input_size=latent_size,
+            in_channels=in_channels,
+            cross_attn=cross_attn,
+            condition_dim=condition_dim
+        ).to(device)
+        print(f"Using standard model: {args.model}")
 
     # Load checkpoint
     checkpoint = torch.load(args.ckpt, map_location='cpu')
-    model.load_state_dict(checkpoint['model'], strict=True)
+    model.load_state_dict(checkpoint['model'], strict=False)  # Use strict=False for SRA compatibility
     model.eval()
     print(f"Loaded ReT model from {args.ckpt}")
 
@@ -192,11 +272,25 @@ def main(args):
     image_encoder.load_state_dict(checkpoint['image_encoder'], strict=True)
     image_encoder.eval()
     
-    rna_encoder = RNAEncoder(
-        input_dim=gene_count_matrix.shape[0],
-        output_dim=64,
-        dropout=0.1
-    ).to(device)
+    # Setup RNA encoder (handle paired vs regular)
+    if args.paired_rna_encoder:
+        rna_encoder = PairedRNAEncoder(
+            input_dim=gene_count_matrix.shape[0] if gene_count_matrix is not None else 2000, 
+            output_dim=128, 
+            dropout=0.1, 
+            num_heads=4, 
+            gene_embed_dim=512, 
+            num_self_attention_layers=1, 
+            num_cross_attention_layers=2,
+            use_bidirectional_cross_attn=True
+        ).to(device)
+    else:
+        rna_encoder = RNAEncoder(
+            input_dim=gene_count_matrix.shape[0] if gene_count_matrix is not None else 2000,
+            output_dim=64,
+            dropout=0.1
+        ).to(device)
+    
     rna_encoder.load_state_dict(checkpoint['rna_encoder'], strict=True) 
     rna_encoder.eval()
     print("Loaded RNA and Image encoders")
@@ -220,7 +314,7 @@ def main(args):
     
     for param in ae_model.parameters():
         param.requires_grad = False
-    del ae_model.text_encoder2
+    del ae_model.text_encoder
     ae_model = ae_model.to(device)
     ae_model.eval()
     print("Loaded autoencoder")
@@ -228,25 +322,80 @@ def main(args):
     # Setup rectified flow
     flow = create_rectified_flow(num_timesteps=1000)
 
-    # Create dataloader
-    loader = create_data_loader(
-        metadata_control=metadata_control,
-        metadata_drug=metadata_drug, 
-        gene_count_matrix=gene_count_matrix,
-        image_json_path=args.image_json_path,
-        drug_data_path=args.drug_data_path,
-        raw_drug_csv_path=args.raw_drug_csv_path,
-        batch_size=args.batch_size,
-        shuffle=True,
-        compound_name_label=args.compound_name_label,
-        debug_mode=args.debug_mode,
-        debug_samples=50,
-        split_train_test=args.split_train_test
-    )
-
-    if args.split_train_test:
-        loader = loader[1]
-        # loader.set_shuffle(True)
+    # Create dataloader with same logic as training
+    if args.dataset in ["gdp", "lincs_rna", "cpgjump", "tahoe"]:
+        # Use dataset-specific loaders that return train/test splits
+        if args.use_test_split:
+            train_loader, test_loader = create_data_loader(
+                metadata_control=metadata_control,
+                metadata_drug=metadata_drug, 
+                gene_count_matrix=gene_count_matrix,
+                image_json_path=args.image_json_path,
+                drug_data_path=args.drug_data_path,
+                raw_drug_csv_path=args.raw_drug_csv_path,
+                batch_size=args.batch_size,
+                shuffle=True,
+                compound_name_label=args.compound_name_label,
+                exclude_cell_lines=args.exclude_cell_lines,
+                exclude_drugs=args.exclude_drugs,
+                debug_mode=args.debug_mode,
+                debug_samples=args.debug_samples,
+                debug_cell_lines=args.debug_cell_lines,
+                debug_drugs=args.debug_drugs,
+                seed=args.global_seed,
+                split_train_test=True,
+                return_datasets=False,
+            )
+            loader = test_loader  # Use test split for generation
+        else:
+            # Use single loader (no splitting)
+            loader = create_data_loader(
+                metadata_control=metadata_control,
+                metadata_drug=metadata_drug, 
+                gene_count_matrix=gene_count_matrix,
+                image_json_path=args.image_json_path,
+                drug_data_path=args.drug_data_path,
+                raw_drug_csv_path=args.raw_drug_csv_path,
+                batch_size=args.batch_size,
+                shuffle=True,
+                compound_name_label=args.compound_name_label,
+                exclude_cell_lines=args.exclude_cell_lines,
+                exclude_drugs=args.exclude_drugs,
+                debug_mode=args.debug_mode,
+                debug_samples=args.debug_samples,
+                debug_cell_lines=args.debug_cell_lines,
+                debug_drugs=args.debug_drugs,
+                seed=args.global_seed,
+                split_train_test=False,
+            )
+    else:
+        # Use leak-free dataloaders for custom dataset
+        if args.use_test_split:
+            train_loader, test_loader = create_data_loader(
+                metadata_control=metadata_control,
+                drug_data_path=args.drug_data_path,
+                raw_drug_csv_path=args.raw_drug_csv_path,
+                metadata_rna=metadata_drug,
+                metadata_imaging=None,  # Assuming no imaging for custom datasets
+                gene_count_matrix=gene_count_matrix,
+                image_json_path=args.image_json_path,
+                batch_size=args.batch_size,
+                shuffle=True,
+                stratify_by=args.stratify_by,
+                compound_name_label=args.compound_name_label,
+                cell_type_label=args.cell_type_label,
+                exclude_cell_lines=args.exclude_cell_lines,
+                exclude_drugs=args.exclude_drugs,
+                debug_mode=args.debug_mode,
+                debug_samples=args.debug_samples,
+                debug_cell_lines=args.debug_cell_lines,
+                debug_drugs=args.debug_drugs,
+                random_state=args.global_seed,
+            )
+            loader = test_loader  # Use test split for generation
+        else:
+            # This would require a different approach for single loader
+            raise ValueError("Single loader not supported for leak-free dataloaders. Use --use-test-split.")
 
     print(f"Created dataloader with {len(loader)} batches")
 
@@ -362,9 +511,6 @@ def main(args):
                         'timestamp': time.time()
                     }
                     results.append(result)
-
-            failed_retrievals = [r for r in results if r['target_smiles'] not in r.get('all_candidates', [])]
-            print(f"Target not in candidates: {len(failed_retrievals)} cases")
 
         elif args.inference_mode == 'generation':
             # Pure generation mode
@@ -536,6 +682,8 @@ def main(args):
     results_json = {
         'metadata': {
             'inference_mode': args.inference_mode,
+            'dataset': args.dataset,
+            'use_test_split': args.use_test_split,
             'confidence_threshold': args.confidence_threshold,
             'retrieval_top_k': args.retrieval_top_k,
             'similarity_metric': args.similarity_metric,
@@ -578,29 +726,40 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="pert2mol")
-    parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/001-LDMol_gdp/checkpoints/0050000.pt')
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()) + list(ReT_SRA_models.keys()), default="pert2mol")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")
     
-    # Data paths
-    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "other"], default="gdp")
-    parser.add_argument("--image-json-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json")
-    parser.add_argument("--drug-data-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl")
-    parser.add_argument("--raw-drug-csv-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv")
-    parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
-    parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
-    parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
+    # Dataset arguments (matching train_pert2mol.py)
+    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "cpgjump", "tahoe", "other"], default="gdp")
+    parser.add_argument("--image-json-path", type=str, default=None)
+    parser.add_argument("--drug-data-path", type=str, default=None)
+    parser.add_argument("--raw-drug-csv-path", type=str, default=None)
+    parser.add_argument("--metadata-control-path", type=str, default=None)
+    parser.add_argument("--metadata-drug-path", type=str, default=None)
+    parser.add_argument("--gene-count-matrix-path", type=str, default=None)
+    parser.add_argument("--use-highly-variable-genes", action="store_true", default=True)
     parser.add_argument("--compound-name-label", type=str, default="compound")
+    parser.add_argument("--cell-type-label", type=str, default="cell_line")
+    parser.add_argument("--stratify-by", type=str, nargs='+', default=None, help="Columns for stratification in train/test split")
     parser.add_argument("--transpose-gene-count-matrix", action="store_true", default=False)
-
+    parser.add_argument("--paired-rna-encoder", action="store_true", help="Use paired RNA encoder for control and treatment")
+    
+    # Data filtering arguments
+    parser.add_argument("--exclude-cell-lines", type=str, nargs='+', default=None, help="Cell lines to exclude")
+    parser.add_argument("--exclude-drugs", type=str, nargs='+', default=None, help="Drugs to exclude")
+    parser.add_argument("--debug-mode", action="store_true", default=False)
+    parser.add_argument("--debug-samples", type=int, default=100, help="Number of samples in debug mode")
+    parser.add_argument("--debug-cell-lines", type=str, nargs='+', default=None, help="Cell lines for debug mode")
+    parser.add_argument("--debug-drugs", type=str, nargs='+', default=None, help="Drugs for debug mode")
+    
     # Generation parameters
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-samples-per-condition", type=int, default=3)
     parser.add_argument("--num-sampling-steps", type=int, default=50)
     parser.add_argument("--max-batches", type=int, default=16)
     parser.add_argument("--global-seed", type=int, default=42)
-    parser.add_argument("--debug-mode", action="store_true")
-    parser.add_argument("--split-train-test", action="store_true")
+    parser.add_argument("--use-test-split", action="store_true", help="Use test split of the data (recommended)")
     
     # Inference mode arguments
     parser.add_argument("--inference-mode", type=str, choices=['retrieval', 'generation', 'adaptive'], 
@@ -613,39 +772,6 @@ if __name__ == "__main__":
                        help='Similarity metric for retrieval mode')
     
     args = parser.parse_args()
-
-    gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
-
-    if args.dataset == "gdp":
-        create_data_loader = create_gdp_dataloaders
-    elif args.dataset == "lincs_rna":
-        create_data_loader = create_lincs_rna_dataloaders
-        gene_count_matrix = gene_count_matrix.T
-    elif args.dataset == "other":
-        for i in ["image_json_path", "gene_count_matrix_path"]:
-            try:
-                if args.__dict__[i] is not None:
-                    assert os.path.exists(args.__dict__[i]), f"Cannot find {args.__dict__[i]}."
-            except Exception as e:
-                print(e, f"; Reset {i} to None")
-                args.__dict__[i] = None
-        assert not (args.image_json_path is None and args.gene_count_matrix_path is None), "Warning: Both image_json_path and gene_count_matrix_path are None. At least one must be provided."
-
-        if args.transpose_gene_count_matrix:
-            gene_count_matrix = gene_count_matrix.T
-        
-        create_data_loader = create_raw_drug_dataloader
-    else:
-        raise ValueError(f"Unknown dataset {args.dataset}.")
-
-    print(f"create_data_loader: {create_data_loader}")
-
-    metadata_control = metadata_drug = None
-    if args.metadata_control_path is not None:
-        metadata_control = pd.read_csv(args.metadata_control_path)
     
-    if args.metadata_drug_path is not None:
-        metadata_drug = pd.read_csv(args.metadata_drug_path)
-
+    print(args)
     main(args)
-

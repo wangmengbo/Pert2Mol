@@ -25,11 +25,14 @@ def prepare_metadata_for_dataset(df, compound_name_label='compound'):
     return df
 
 
-def create_cpgjump_dataloaders(metadata_control: pd.DataFrame=None,
+def create_cpgjump_dataloaders(
+    metadata_control: pd.DataFrame=None,
+    metadata_control_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/metadata_control.csv",
     metadata_drug: pd.DataFrame=None,
-    drug_data_path: str=None,
-    raw_drug_csv_path: str=None,
-    image_json_path: str = None,
+    metadata_drug_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/metadata_drug.csv",
+    drug_data_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/preprocessed_drug_data.h5",
+    raw_drug_csv_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/compound_metadata.csv",
+    image_json_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/image_paths.4_channels.json",
     gene_count_matrix: pd.DataFrame = None,
     compound_name_label='compound',
     batch_size: int = 4,
@@ -49,28 +52,23 @@ def create_cpgjump_dataloaders(metadata_control: pd.DataFrame=None,
     split_train_test: bool = True,
     test_size: float = 0.1,
     return_datasets: bool = False,  # Add this parameter
-    seed: int = 42,
+    random_state: int = 42,
     **kwargs
     ):
-    # Your file paths
-    IMAGE_JSON_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/image_paths.4_channels.json"
-    DRUG_DATA_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/preprocessed_drug_data.h5"
-    RAW_DRUG_CSV_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/compound_metadata.csv"
-    METADATA_CONTROL_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/metadata_control.csv"
-    METADATA_DRUG_PATH = "/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/dataset/cpg/cpg0000-jump-pilot/metadata_drug.csv"
+    if metadata_control is None:
+        metadata_control = pd.read_csv(metadata_control_path)
 
-    metadata_control = pd.read_csv(METADATA_CONTROL_PATH)
-    metadata_drug = pd.read_csv(METADATA_DRUG_PATH)
+    if metadata_drug is None:
+        metadata_drug = pd.read_csv(metadata_drug_path)
 
     # Create leak-free train/test dataloaders
     train_loader, test_loader = create_leak_free_dataloaders(
-        metadata_control,
-        DRUG_DATA_PATH,
-        RAW_DRUG_CSV_PATH,
+        metadata_control=metadata_control,
+        drug_data_path=drug_data_path,
+        raw_drug_csv_path=raw_drug_csv_path,
         metadata_rna=None,
         metadata_imaging=metadata_drug,
-        image_json_path=IMAGE_JSON_PATH,
-        # test_size=test_size,
+        image_json_path=image_json_path,
         final_train_test_ratio = (1-test_size)/test_size,
         batch_size=batch_size,
         shuffle=True,
@@ -83,7 +81,7 @@ def create_cpgjump_dataloaders(metadata_control: pd.DataFrame=None,
         debug_samples=debug_samples,
         debug_cell_lines=debug_cell_lines,
         debug_drugs=debug_drugs,
-        random_state=seed,
+        random_state=random_state,
     )
     
     logger.info(f"Train samples: {len(train_loader.dataset)}")

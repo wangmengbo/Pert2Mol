@@ -13,6 +13,11 @@ import pandas as pd
 from rdkit import Chem
 from tqdm import tqdm
 import warnings
+import json
+import hashlib
+import os
+import signal
+from glob import glob
 warnings.filterwarnings('ignore')
 RDLogger.DisableLog('rdApp.*')
 
@@ -127,29 +132,6 @@ def AE_SMILES_decoder(pv, model, stochastic=False, k=2, max_length=150):
     return candidate
 
 
-def dual_rna_image_encoder(control_images, treatment_images, control_rna, treatment_rna, 
-                          image_encoder, rna_encoder, device):
-    """
-    Encode paired control and treatment images + RNA with selective dropout for CFG.
-    """
-    # Encode images
-    control_img_features = image_encoder(control_images.to(device))
-    treatment_img_features = image_encoder(treatment_images.to(device))
-    
-    # Encode RNA
-    control_rna_features = rna_encoder(control_rna.to(device))
-    treatment_rna_features = rna_encoder(treatment_rna.to(device))
-    
-    # Concatenate features
-    control_features = torch.cat([control_img_features, control_rna_features], dim=-1)
-    treatment_features = torch.cat([treatment_img_features, treatment_rna_features], dim=-1)
-    
-    combined_features = torch.stack([control_features, treatment_features], dim=1)
-    attention_mask = torch.ones(combined_features.size(0), 2, dtype=torch.bool, device=device)
-    
-    return combined_features, attention_mask
-
-
 def get_validity(smiles):
     from rdkit import Chem
     v = []
@@ -175,6 +157,7 @@ acronyms = "([A-Z][.][A-Z][.](?:[A-Z][.])?)"
 websites = "[.](com|net|org|io|gov|edu|me)"
 digits = "([0-9])"
 multiple_dots = r'\.{2,}'
+
 
 def split_into_sentences(text: str) -> list[str]:
     """
@@ -215,6 +198,7 @@ def split_into_sentences(text: str) -> list[str]:
     sentences = [s.strip() for s in sentences]
     if sentences and not sentences[-1]: sentences = sentences[:-1]
     return sentences
+
 
 class regexTokenizer():
     def __init__(self,vocab_path='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/vocab_bpe_300_sc.txt',max_len=127):
@@ -469,4 +453,371 @@ def standardize_smiles_batch_with_stats(smiles_list,
         result['mapping'] = mapping
     
     return result
+
+
+def get_hash(namespace):
+    """
+    Generate an 8-character hash from argparse Namespace object.
+    
+    Args:
+        namespace: argparse.Namespace object from parse_args()
+        
+    Returns:
+        str: 8-character hexadecimal hash
+    """
+    # Convert namespace to dict and create hash
+    data = json.dumps(vars(namespace), sort_keys=True, default=str)
+    return hashlib.sha256(data.encode()).hexdigest()[:8]
+
+
+def setup_signal_handlers(checkpoint_dir, experiment_dir, auto_requeue=False):
+    """Setup signal handlers for graceful shutdown and checkpointing"""
+    global CHECKPOINT_DIR, EXPERIMENT_DIR, AUTO_REQUEUE
+    CHECKPOINT_DIR = checkpoint_dir
+    EXPERIMENT_DIR = experiment_dir
+    AUTO_REQUEUE = auto_requeue
+    
+    def signal_handler(signum, frame):
+        global GRACEFUL_SHUTDOWN
+        print(f"\n[SIGNAL] Received signal {signum}. Initiating graceful shutdown...")
+        GRACEFUL_SHUTDOWN = True
+        
+        # Try to requeue the job if running under SLURM and auto_requeue is enabled
+        if AUTO_REQUEUE:
+            try:
+                import os
+                job_id = os.environ.get('SLURM_JOB_ID')
+                if job_id:
+                    print(f"[SLURM] Attempting to requeue job {job_id} (auto-resume enabled)")
+                    os.system(f'scontrol requeue {job_id}')
+                else:
+                    print("[SIGNAL] Auto-resume enabled but not running under SLURM")
+            except Exception as e:
+                print(f"[SLURM] Failed to requeue: {e}")
+        else:
+            print("[SIGNAL] Auto-resume disabled, will not requeue job")
+    
+    # Register handlers for catchable signals
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+    signal.signal(signal.SIGINT, signal_handler)   # Interrupt signal (Ctrl+C)
+    signal.signal(signal.SIGUSR1, signal_handler)  # User signal 1
+    
+    requeue_status = "enabled" if auto_requeue else "disabled"
+    print(f"[SIGNAL] Signal handlers registered for graceful shutdown (auto-requeue: {requeue_status})")
+
+
+def save_emergency_checkpoint(model, image_encoder, rna_encoder, ema, opt, args, 
+                            sra_teacher_manager, train_steps, use_ddp, rank):
+    """Save checkpoint during emergency shutdown"""
+    global CHECKPOINT_DIR, CURRENT_STEP
+    
+    if not CHECKPOINT_DIR or (use_ddp and rank != 0):
+        return
+        
+    try:
+        print(f"[EMERGENCY] Saving checkpoint at step {train_steps}")
+        
+        if use_ddp:
+            checkpoint = {
+                "model": model.module.state_dict(),
+                "image_encoder": image_encoder.module.state_dict(),
+                "rna_encoder": rna_encoder.module.state_dict(),
+                "ema": ema.state_dict(),
+                "opt": opt.state_dict(),
+                "args": args,
+                "train_steps": train_steps,
+                "emergency_save": True
+            }
+            if args.use_sra and sra_teacher_manager is not None:
+                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+        else:
+            checkpoint = {
+                "model": model.state_dict(),
+                "image_encoder": image_encoder.state_dict(),
+                "rna_encoder": rna_encoder.state_dict(),
+                "ema": ema.state_dict(),
+                "opt": opt.state_dict(),
+                "args": args,
+                "train_steps": train_steps,
+                "emergency_save": True
+            }
+            if args.use_sra and sra_teacher_manager is not None:
+                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+        
+        emergency_path = f"{CHECKPOINT_DIR}/emergency_{train_steps:07d}.pt"
+        torch.save(checkpoint, emergency_path)
+        print(f"[EMERGENCY] Checkpoint saved to {emergency_path}")
+        
+        # Also create a latest.pt symlink
+        latest_path = f"{CHECKPOINT_DIR}/latest.pt"
+        if os.path.exists(latest_path):
+            os.remove(latest_path)
+        os.symlink(os.path.basename(emergency_path), latest_path)
+        
+    except Exception as e:
+        print(f"[EMERGENCY] Failed to save checkpoint: {e}")
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in the directory"""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    
+    # Look for latest.pt symlink first
+    latest_path = os.path.join(checkpoint_dir, "latest.pt")
+    if os.path.exists(latest_path) and os.path.islink(latest_path):
+        target = os.path.join(checkpoint_dir, os.readlink(latest_path))
+        if os.path.exists(target):
+            return target
+    
+    # Fallback: find highest numbered checkpoint
+    checkpoint_files = glob(f"{checkpoint_dir}/*.pt")
+    if not checkpoint_files:
+        return None
+    
+    # Extract step numbers and find maximum
+    max_step = -1
+    latest_file = None
+    
+    for file in checkpoint_files:
+        basename = os.path.basename(file)
+        if basename.startswith(('emergency_', '')):
+            # Extract step number
+            try:
+                if basename.startswith('emergency_'):
+                    step_str = basename[10:17]  # emergency_0123456.pt
+                else:
+                    step_str = basename[:7]     # 0123456.pt
+                step = int(step_str)
+                if step > max_step:
+                    max_step = step
+                    latest_file = file
+            except (ValueError, IndexError):
+                continue
+    
+    return latest_file
+
+
+def load_checkpoint_and_resume(checkpoint_path, model, image_encoder, rna_encoder, ema, opt, 
+                              sra_teacher_manager, use_ddp, rank, logger):
+    """Load checkpoint and return resume step"""
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return 0
+    
+    try:
+        if not use_ddp or rank == 0:
+            logger.info(f"[RESUME] Loading checkpoint from {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Load model states
+        if use_ddp:
+            model.module.load_state_dict(checkpoint["model"])
+            image_encoder.module.load_state_dict(checkpoint["image_encoder"])
+            rna_encoder.module.load_state_dict(checkpoint["rna_encoder"])
+        else:
+            model.load_state_dict(checkpoint["model"])
+            image_encoder.load_state_dict(checkpoint["image_encoder"])
+            rna_encoder.load_state_dict(checkpoint["rna_encoder"])
+        
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        
+        # Load SRA teacher if available
+        if "sra_teacher" in checkpoint and sra_teacher_manager is not None:
+            sra_teacher_manager.get_teacher().load_state_dict(checkpoint["sra_teacher"])
+        
+        resume_step = checkpoint.get("train_steps", 0)
+        emergency_save = checkpoint.get("emergency_save", False)
+        
+        if not use_ddp or rank == 0:
+            save_type = "emergency" if emergency_save else "regular"
+            logger.info(f"[RESUME] Loaded {save_type} checkpoint, resuming from step {resume_step}")
+        
+        return resume_step
+        
+    except Exception as e:
+        if not use_ddp or rank == 0:
+            logger.error(f"[RESUME] Failed to load checkpoint {checkpoint_path}: {e}")
+        return 0
+
+
+class EarlyStopping:
+    """Early stopping utility to stop training when validation loss stops improving."""
+    
+    def __init__(self, patience=10, min_delta=0.0, restore_best_weights=True, mode='min', verbose=True):
+        """
+        Args:
+            patience (int): Number of epochs with no improvement after which training will be stopped
+            min_delta (float): Minimum change to qualify as an improvement
+            restore_best_weights (bool): Whether to restore model weights from best epoch
+            mode (str): 'min' for minimization, 'max' for maximization
+            verbose (bool): Whether to print early stopping messages
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.mode = mode
+        self.verbose = verbose
+        
+        self.wait = 0
+        self.best_score = None
+        self.best_weights = None
+        self.should_stop = False
+        
+        # Set comparison functions based on mode
+        if mode == 'min':
+            self.is_better = lambda current, best: current < (best - min_delta)
+        elif mode == 'max':
+            self.is_better = lambda current, best: current > (best + min_delta)
+        else:
+            raise ValueError(f"Mode {mode} is unknown, expected 'min' or 'max'")
+    
+    def __call__(self, current_score, model=None, step=None):
+        """
+        Check if training should stop early.
+        
+        Args:
+            current_score (float): Current validation score
+            model (torch.nn.Module, optional): Model to save best weights from
+            step (int, optional): Current training step
+            
+        Returns:
+            bool: True if training should stop
+        """
+        if self.best_score is None:
+            self.best_score = current_score
+            if model is not None and self.restore_best_weights:
+                self.best_weights = self._get_model_state(model)
+            if self.verbose:
+                print(f"Early stopping: Initial score set to {current_score:.6f}")
+        elif self.is_better(current_score, self.best_score):
+            # Improvement found
+            self.best_score = current_score
+            self.wait = 0
+            if model is not None and self.restore_best_weights:
+                self.best_weights = self._get_model_state(model)
+            if self.verbose:
+                print(f"Early stopping: New best score {current_score:.6f} (improvement of {abs(current_score - self.best_score):.6f})")
+        else:
+            # No improvement
+            self.wait += 1
+            if self.verbose:
+                print(f"Early stopping: No improvement for {self.wait}/{self.patience} checks. Best: {self.best_score:.6f}, Current: {current_score:.6f}")
+            
+            if self.wait >= self.patience:
+                self.should_stop = True
+                if self.verbose:
+                    print(f"Early stopping: Stopping training after {self.patience} checks without improvement")
+                
+                # Restore best weights if requested
+                if model is not None and self.restore_best_weights and self.best_weights is not None:
+                    self._restore_model_state(model, self.best_weights)
+                    if self.verbose:
+                        print("Early stopping: Restored best model weights")
+                
+                return True
+        
+        return False
+    
+    def _get_model_state(self, model):
+        """Get model state dict, handling DDP wrapper."""
+        if hasattr(model, 'module'):
+            return model.module.state_dict()
+        return model.state_dict()
+    
+    def _restore_model_state(self, model, state_dict):
+        """Restore model state dict, handling DDP wrapper."""
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(state_dict)
+    
+    def state_dict(self):
+        """Return state dictionary for checkpoint saving."""
+        return {
+            'patience': self.patience,
+            'min_delta': self.min_delta,
+            'restore_best_weights': self.restore_best_weights,
+            'mode': self.mode,
+            'verbose': self.verbose,
+            'wait': self.wait,
+            'best_score': self.best_score,
+            'best_weights': self.best_weights,
+            'should_stop': self.should_stop
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Load state from checkpoint."""
+        self.patience = state_dict['patience']
+        self.min_delta = state_dict['min_delta']
+        self.restore_best_weights = state_dict['restore_best_weights']
+        self.mode = state_dict['mode']
+        self.verbose = state_dict['verbose']
+        self.wait = state_dict['wait']
+        self.best_score = state_dict['best_score']
+        self.best_weights = state_dict['best_weights']
+        self.should_stop = state_dict['should_stop']
+
+
+def collect_all_drugs_from_csv(raw_drug_csv_path, compound_name_label='compound', smiles_label='canonical_smiles'):
+    """Collect all drugs from the raw drug CSV file for comprehensive retrieval."""
+    
+    print(f"Loading all drugs from raw CSV: {raw_drug_csv_path}")
+    
+    try:
+        # Load the raw drug CSV
+        drug_df = pd.read_csv(raw_drug_csv_path)
+        print(f"Loaded {len(drug_df)} total drug entries from CSV")
+        
+        # Filter out entries without valid SMILES or compound names
+        valid_entries = drug_df[
+            drug_df[compound_name_label].notna() & 
+            drug_df[smiles_label].notna()
+        ].copy()
+        
+        print(f"Found {len(valid_entries)} entries with valid compound names and SMILES")
+        
+        # Get unique compounds and their SMILES
+        compound_to_smiles = {}
+        smiles_to_compound = {}
+        
+        for _, row in valid_entries.iterrows():
+            compound = row[compound_name_label]
+            smiles = row[smiles_label]
+            
+            # Convert to aromatic SMILES for consistency
+            try:
+                from dataloaders.utils import convert_to_aromatic_smiles
+                canonical_smiles = convert_to_aromatic_smiles(smiles)
+                if canonical_smiles:
+                    compound_to_smiles[compound] = canonical_smiles
+                    smiles_to_compound[canonical_smiles] = compound
+            except:
+                # Fallback to original SMILES if conversion fails
+                compound_to_smiles[compound] = smiles
+                smiles_to_compound[smiles] = compound
+        
+        # Create the training_drugs structure
+        training_drugs = {
+            'compound_names': list(compound_to_smiles.keys()),
+            'smiles': list(smiles_to_compound.keys()),
+            'compound_to_smiles': compound_to_smiles,
+            'smiles_to_compound': smiles_to_compound
+        }
+        
+        print(f"Collected {len(training_drugs['compound_names'])} unique compounds")
+        print(f"Collected {len(training_drugs['smiles'])} unique SMILES")
+        
+        return training_drugs
+        
+    except Exception as e:
+        print(f"Error loading drugs from CSV: {e}")
+        # Fallback to empty structure
+        return {
+            'compound_names': [],
+            'smiles': [],
+            'compound_to_smiles': {},
+            'smiles_to_compound': {}
+        }
 

@@ -114,8 +114,9 @@ def create_dataloader(
     drug_encoder: Optional[torch.nn.Module] = None,
     debug_mode: bool = False,
     debug_samples: int = None,
-    debug_cell_lines: Optional[List[str]] = None,
-    debug_drugs: Optional[List[str]] = None,
+    
+    include_cell_lines: Optional[List[str]] = None,
+    include_drugs: Optional[List[str]] = None,
     exclude_drugs: Optional[List[str]] = None,
 
     fallback_smiles_dict: Optional[Dict[str, str]] = None,
@@ -128,7 +129,7 @@ def create_dataloader(
         ... (same as before)
         debug_mode: If True, only load a subset of data for debugging
         debug_samples: Number of samples to load in debug mode
-        debug_cell_lines: Specific cell lines to use for debugging
+        include_cell_lines: Specific cell lines to use for debugging
     """
     # Load image paths from JSON file
     with open(image_json_path, 'r') as f:
@@ -151,8 +152,8 @@ def create_dataloader(
         drug_encoder=drug_encoder,
         debug_mode=debug_mode,
         debug_samples=debug_samples,
-        debug_cell_lines=debug_cell_lines,
-        debug_drugs=debug_drugs,
+        include_cell_lines=include_cell_lines,
+        include_drugs=include_drugs,
         exclude_drugs=exclude_drugs
     )
     
@@ -256,7 +257,7 @@ def create_raw_drug_dataloader(
     image_json_path: str = None,
     gene_count_matrix: pd.DataFrame = None,
     cell_type_label: str = 'cell_line',
-    extra_labels_to_match: Optional[List[str]] = None,
+    extra_labels_to_match: Optional[List[str]] = [],
     compound_name_label: str = 'compound',
     smiles_label: str = 'canonical_smiles',
     batch_size: int = 4,
@@ -268,17 +269,22 @@ def create_raw_drug_dataloader(
     n_top_genes: int = 2000,
     normalize: bool = True,
     zscore: bool = True,
+    exclude_cell_lines: Optional[List[str]] = None,
+    exclude_drugs: Optional[List[str]] = None,
+    include_cell_lines: Optional[List[str]] = None,
+    include_drugs: Optional[List[str]] = None,
     debug_mode: bool = False,
     debug_samples: int = 50,
-    debug_cell_lines: Optional[List[str]] = None,
-    debug_drugs: Optional[List[str]] = None,
     smiles_cache: Optional[Dict] = None,
     split_train_test: bool = True,
     test_size: float = 0.2,
     **kwargs):
+    """Create DataLoader for raw drug CSV data with biological conditioning"""
     logger.info(f"extra_labels_to_match={extra_labels_to_match}")
 
-    """Create DataLoader for raw drug CSV data with biological conditioning"""
+    original_control_count = len(metadata_control)
+    original_drug_count = len(metadata_drug)
+
     # Load image paths
     if image_json_path is not None and os.path.exists(image_json_path):
         with open(image_json_path, 'r') as f:
@@ -286,6 +292,33 @@ def create_raw_drug_dataloader(
     else:
         image_json_dict = {}
         logger.info("No image JSON path provided or file does not exist - proceeding without images")
+
+    # Apply include filtering (takes precedence over exclude)
+    if include_cell_lines:
+        metadata_control = metadata_control[metadata_control[cell_type_label].isin(include_cell_lines)]
+        metadata_drug = metadata_drug[metadata_drug[cell_type_label].isin(include_cell_lines)]
+        logger.info(f"Included cell lines: {include_cell_lines}")
+        logger.info(f"Control after include filter: {original_control_count} → {len(metadata_control)}")
+        logger.info(f"Drug after include filter: {original_drug_count} → {len(metadata_drug)}")
+    
+    if include_drugs:
+        original_drug_count_before_drug_filter = len(metadata_drug)
+        metadata_drug = metadata_drug[metadata_drug[compound_name_label].isin(include_drugs)]
+        logger.info(f"Included drugs: {include_drugs}")
+        logger.info(f"Drug after drug include filter: {original_drug_count_before_drug_filter} → {len(metadata_drug)}")
+
+    # Apply exclude filtering only if include filters weren't used
+    if exclude_cell_lines and not include_cell_lines:
+        metadata_control = metadata_control[~metadata_control[cell_type_label].isin(exclude_cell_lines)]
+        metadata_drug = metadata_drug[~metadata_drug[cell_type_label].isin(exclude_cell_lines)]
+        logger.info(f"Excluded cell lines: {exclude_cell_lines}")
+    
+    if exclude_drugs and not include_drugs:
+        metadata_drug = metadata_drug[~metadata_drug[compound_name_label].isin(exclude_drugs)]
+        logger.info(f"Excluded drugs: {exclude_drugs}")
+    
+    logger.info(f"Final filtering result: Control {original_control_count} → {len(metadata_control)}, "
+                f"Drug {original_drug_count} → {len(metadata_drug)}")
 
     # Create dataset
     dataset = RawDrugDataset(
@@ -304,8 +337,8 @@ def create_raw_drug_dataloader(
         smiles_cache=smiles_cache,
         debug_mode=debug_mode,
         debug_samples=debug_samples,
-        debug_cell_lines=debug_cell_lines,
-        debug_drugs=debug_drugs,
+        include_cell_lines=include_cell_lines,
+        include_drugs=include_drugs,
         smiles_only=True,
         **kwargs
     )
@@ -424,7 +457,7 @@ def _prepare_metadata_for_dataset(combined_df, compound_name_label='compound'):
     
     # Use RNA sample IDs for transcriptomics data
     if 'sample_id:rna' in combined_df.columns:
-        metadata_drug['sample_id'] = combined_df['sample_id:rna'].astype(str)
+        metadata_drug[sample_id_label] = combined_df['sample_id:rna'].astype(str)
     
     # Use imaging json_key for image loading
     if 'json_key:hist' in combined_df.columns:
@@ -435,7 +468,7 @@ def _prepare_metadata_for_dataset(combined_df, compound_name_label='compound'):
         if col in metadata_drug.columns:
             metadata_drug[col] = pd.to_numeric(metadata_drug[col], errors='coerce')
     
-    for col in [compound_name_label, 'cell_line', 'sample_id', 'json_key']:
+    for col in [compound_name_label, 'cell_line', sample_id_label, 'json_key']:
         if col in metadata_drug.columns:
             metadata_drug[col] = metadata_drug[col].astype(str)
     
@@ -523,9 +556,9 @@ def _create_modality_combinations(rna_df, imaging_df, compound_name_label='compo
 
 
 def create_leak_free_dataloaders(
-    metadata_control: pd.DataFrame,
-    drug_data_path: str,
-    raw_drug_csv_path: str,
+    metadata_control: pd.DataFrame=None,
+    drug_data_path: str=None,
+    raw_drug_csv_path: str=None,
     metadata_rna: Optional[pd.DataFrame] = None,
     metadata_imaging: Optional[pd.DataFrame] = None,
     shared_drugs: Optional[List[str]] = None,
@@ -536,23 +569,27 @@ def create_leak_free_dataloaders(
     n_top_genes: int = 2000,
     normalize: bool = True,
     zscore: bool = True,
-    final_train_test_ratio: float = 4.0,  # Desired train:test ratio for final combinations
-    test_size: Optional[float] = None,  # Deprecated - computed automatically
+    final_train_test_ratio: float = 4.0,
+    test_size: Optional[float] = None,
     random_state: int = 42,
     batch_size: int = 8,
     shuffle: bool = True,
+    shuffle_test: bool = False,
     num_workers: int = 0,
     stratify_by: Optional[List[str]] = None,
     compound_name_label: str = 'compound',
+    sample_id_label: str = 'sample_id',
     cell_type_label: str = 'cell_line',
-    extra_labels_to_match: Optional[List[str]] = None,
+    extra_labels_to_match: Optional[List[str]] = [],
     smiles_label: str = 'canonical_smiles',
     create_modality_combinations=_create_modality_combinations,
     prepare_metadata_for_dataset=_prepare_metadata_for_dataset,
+    exclude_cell_lines: Optional[List[str]] = None,
+    exclude_drugs: Optional[List[str]] = None,
+    include_cell_lines: Optional[List[str]] = None,
+    include_drugs: Optional[List[str]] = None,
     debug_mode: bool = False,
     debug_samples: int = 50,
-    debug_cell_lines: Optional[List[str]] = None,
-    debug_drugs: Optional[List[str]] = None,
     **dataloader_kwargs) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
     Create leak-free train/test dataloaders with balanced combination ratios.
@@ -561,10 +598,64 @@ def create_leak_free_dataloaders(
         final_train_test_ratio: Desired ratio of train:test combinations (default 4.0 for 80:20)
         test_size: Deprecated - ratio is computed automatically for balanced splits
     """
-    # # print all arguments passed to the function
-    # print("Arguments passed to create_cpgjump_dataloaders:")
-    # for arg, value in locals().items():
-    #     print(f"{arg}: {value}")
+    
+    # Apply include filtering first (takes precedence over exclude)
+    if include_cell_lines:
+        original_control_count = len(metadata_control)
+        metadata_control = metadata_control[metadata_control[cell_type_label].isin(include_cell_lines)]
+        logger.info(f"Included {len(include_cell_lines)} cell lines from control: {include_cell_lines}")
+        logger.info(f"Control samples: {original_control_count} → {len(metadata_control)}")
+        
+        if metadata_rna is not None:
+            original_rna_count = len(metadata_rna)
+            metadata_rna = metadata_rna[metadata_rna[cell_type_label].isin(include_cell_lines)]
+            logger.info(f"RNA samples: {original_rna_count} → {len(metadata_rna)}")
+            
+        if metadata_imaging is not None:
+            original_imaging_count = len(metadata_imaging)
+            metadata_imaging = metadata_imaging[metadata_imaging[cell_type_label].isin(include_cell_lines)]
+            logger.info(f"Imaging samples: {original_imaging_count} → {len(metadata_imaging)}")
+
+    if include_drugs:
+        if metadata_rna is not None:
+            original_rna_count = len(metadata_rna)
+            metadata_rna = metadata_rna[metadata_rna[compound_name_label].isin(include_drugs)]
+            logger.info(f"Included {len(include_drugs)} drugs from RNA: {include_drugs}")
+            logger.info(f"RNA samples after drug inclusion: {original_rna_count} → {len(metadata_rna)}")
+            
+        if metadata_imaging is not None:
+            original_imaging_count = len(metadata_imaging)
+            metadata_imaging = metadata_imaging[metadata_imaging[compound_name_label].isin(include_drugs)]
+            logger.info(f"Imaging samples after drug inclusion: {original_imaging_count} → {len(metadata_imaging)}")
+
+    # Apply exclude filtering only if include filters weren't used
+    if exclude_cell_lines and not include_cell_lines:
+        original_control_count = len(metadata_control)
+        metadata_control = metadata_control[~metadata_control[cell_type_label].isin(exclude_cell_lines)]
+        logger.info(f"Excluded {len(exclude_cell_lines)} cell lines from control: {exclude_cell_lines}")
+        logger.info(f"Control samples: {original_control_count} → {len(metadata_control)}")
+        
+        if metadata_rna is not None:
+            original_rna_count = len(metadata_rna)
+            metadata_rna = metadata_rna[~metadata_rna[cell_type_label].isin(exclude_cell_lines)]
+            logger.info(f"RNA samples: {original_rna_count} → {len(metadata_rna)}")
+            
+        if metadata_imaging is not None:
+            original_imaging_count = len(metadata_imaging)
+            metadata_imaging = metadata_imaging[~metadata_imaging[cell_type_label].isin(exclude_cell_lines)]
+            logger.info(f"Imaging samples: {original_imaging_count} → {len(metadata_imaging)}")
+    
+    if exclude_drugs and not include_drugs:
+        if metadata_rna is not None:
+            original_rna_count = len(metadata_rna)
+            metadata_rna = metadata_rna[~metadata_rna[compound_name_label].isin(exclude_drugs)]
+            logger.info(f"Excluded {len(exclude_drugs)} drugs from RNA: {exclude_drugs}")
+            logger.info(f"RNA samples after drug exclusion: {original_rna_count} → {len(metadata_rna)}")
+            
+        if metadata_imaging is not None:
+            original_imaging_count = len(metadata_imaging)
+            metadata_imaging = metadata_imaging[~metadata_imaging[compound_name_label].isin(exclude_drugs)]
+            logger.info(f"Imaging samples after drug exclusion: {original_imaging_count} → {len(metadata_imaging)}")
    
     has_rna = metadata_rna is not None and not metadata_rna.empty
     has_imaging = metadata_imaging is not None and not metadata_imaging.empty
@@ -643,13 +734,13 @@ def create_leak_free_dataloaders(
     rna_test = pd.DataFrame()
 
     if has_rna:
-        unique_rna_samples = rna_filtered['sample_id'].unique()
+        unique_rna_samples = rna_filtered[sample_id_label].unique()
         logger.info(f"Found {len(unique_rna_samples)} unique RNA sample IDs")
         
         if len(unique_rna_samples) > 1:
             try:
                 if stratify_by is not None:
-                    rna_sample_info = rna_filtered.groupby('sample_id').first()
+                    rna_sample_info = rna_filtered.groupby(sample_id_label).first()
                     rna_strata = create_strata_labels(rna_sample_info.loc[unique_rna_samples], stratify_by)
                 else:
                     rna_strata = None
@@ -668,8 +759,8 @@ def create_leak_free_dataloaders(
                     random_state=random_state
                 )
             
-            rna_train = rna_filtered[rna_filtered['sample_id'].isin(rna_train_ids)].reset_index(drop=True)
-            rna_test = rna_filtered[rna_filtered['sample_id'].isin(rna_test_ids)].reset_index(drop=True)
+            rna_train = rna_filtered[rna_filtered[sample_id_label].isin(rna_train_ids)].reset_index(drop=True)
+            rna_test = rna_filtered[rna_filtered[sample_id_label].isin(rna_test_ids)].reset_index(drop=True)
         else:
             rna_train = rna_filtered
             rna_test = pd.DataFrame(columns=rna_filtered.columns)
@@ -712,8 +803,8 @@ def create_leak_free_dataloaders(
     
     # Log split results with predicted combination counts
     if has_rna:
-        rna_train_count = len(rna_train['sample_id'].unique())
-        rna_test_count = len(rna_test['sample_id'].unique())
+        rna_train_count = len(rna_train[sample_id_label].unique())
+        rna_test_count = len(rna_test[sample_id_label].unique())
         logger.info(f"RNA train: {len(rna_train)} rows, {rna_train_count} unique samples")
         logger.info(f"RNA test: {len(rna_test)} rows, {rna_test_count} unique samples")
 
@@ -735,8 +826,8 @@ def create_leak_free_dataloaders(
     
     # Verify no overlap in unique sample IDs
     if has_rna:
-        rna_train_unique = set(rna_train['sample_id'].unique())
-        rna_test_unique = set(rna_test['sample_id'].unique())
+        rna_train_unique = set(rna_train[sample_id_label].unique())
+        rna_test_unique = set(rna_test[sample_id_label].unique())
         rna_split_overlap = rna_train_unique.intersection(rna_test_unique)
         if rna_split_overlap:
             logger.error(f"❌ RNA split overlap: {len(rna_split_overlap)} samples in both splits")
@@ -777,8 +868,8 @@ def create_leak_free_dataloaders(
         # Check for sample leakage in final combinations
         if single_modality:
             if has_rna:
-                train_unique = set(train_combinations['sample_id'].unique())
-                test_unique = set(test_combinations['sample_id'].unique())
+                train_unique = set(train_combinations[sample_id_label].unique())
+                test_unique = set(test_combinations[sample_id_label].unique())
                 overlap = train_unique.intersection(test_unique)
                 if overlap:
                     logger.error(f"❌ RNA single modality overlap: {len(overlap)} samples")
@@ -854,8 +945,8 @@ def create_leak_free_dataloaders(
             split_train_test=False,
             debug_mode=debug_mode,
             debug_samples=debug_samples,
-            debug_cell_lines=debug_cell_lines,
-            debug_drugs=debug_drugs,
+            include_cell_lines=include_cell_lines,
+            include_drugs=include_drugs,
             **dataloader_kwargs
         )
     else:
@@ -876,13 +967,13 @@ def create_leak_free_dataloaders(
             compound_name_label=compound_name_label,
             smiles_label=smiles_label,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=shuffle_test,
             num_workers=num_workers,
             split_train_test=False,
             debug_mode=debug_mode,
             debug_samples=debug_samples,
-            debug_cell_lines=debug_cell_lines,
-            debug_drugs=debug_drugs,
+            include_cell_lines=include_cell_lines,
+            include_drugs=include_drugs,
             **dataloader_kwargs
         )
     else:

@@ -23,6 +23,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         return self.main_branch(x) + self.skip(x)
 
+
 class GeneMultiHeadAttention(nn.Module):
     """Multi-head self-attention for genes to attend to each other."""
     def __init__(self, embed_dim, num_heads, dropout=0.1):
@@ -248,6 +249,446 @@ class RNAEncoder(nn.Module):
             
             return attention_weights_all  # List of [B, num_heads, N, N] tensors
 
+class GeneConditionCrossAttention(nn.Module):
+    """Cross-attention between control and treatment gene representations."""
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # Separate Q, K, V projections for cross-attention
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False) 
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query, key_value):
+        """
+        query: [B, N, D] - genes from one condition (e.g., control)
+        key_value: [B, N, D] - genes from other condition (e.g., treatment)
+        """
+        B, N, D = query.shape
+        
+        # Generate Q from query, K and V from key_value
+        q = self.q_proj(query).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(key_value).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(key_value).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        # Cross-attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, num_heads, N, N]
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        out = torch.matmul(attn_weights, v)  # [B, num_heads, N, head_dim]
+        out = out.transpose(1, 2).reshape(B, N, D)  # [B, N, D]
+        
+        return self.out_proj(out), attn_weights
+
+class PairedRNAEncoder(nn.Module):
+    """
+    Encoder for paired RNA expression data (control vs treatment) with explicit
+    gene-to-gene cross-attention to learn which pre-treatment genes map to 
+    which post-treatment genes for drug prediction.
+    """
+    def __init__(self, input_dim, hidden_dims=[512, 256], output_dim=256, 
+                dropout=0.1, num_heads=4, gene_embed_dim=512, 
+                num_self_attention_layers=1, num_cross_attention_layers=1,
+                use_bidirectional_cross_attn=True, enable_separate_outputs=True):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.gene_embed_dim = gene_embed_dim
+        self.use_bidirectional_cross_attn = use_bidirectional_cross_attn
+        
+        # Shared gene embedding network for both conditions
+        self.gene_embedding = nn.Sequential(
+            nn.Linear(1, gene_embed_dim // 2),
+            nn.SiLU(),
+            nn.Linear(gene_embed_dim // 2, gene_embed_dim),
+            nn.LayerNorm(gene_embed_dim)
+        )
+        
+        # Self-attention layers for each condition (applied separately)
+        self.self_attention_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'attention': GeneMultiHeadAttention(gene_embed_dim, num_heads, dropout),
+                'norm1': nn.LayerNorm(gene_embed_dim),
+                'norm2': nn.LayerNorm(gene_embed_dim),
+                'ffn': nn.Sequential(
+                    nn.Linear(gene_embed_dim, gene_embed_dim * 2),
+                    nn.SiLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(gene_embed_dim * 2, gene_embed_dim),
+                    nn.Dropout(dropout)
+                )
+            }) for _ in range(num_self_attention_layers)
+        ])
+        
+        # Cross-attention layers between conditions
+        self.cross_attention_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'control_to_treatment': GeneConditionCrossAttention(gene_embed_dim, num_heads, dropout),
+                'treatment_to_control': GeneConditionCrossAttention(gene_embed_dim, num_heads, dropout) if use_bidirectional_cross_attn else None,
+                'norm_control': nn.LayerNorm(gene_embed_dim),
+                'norm_treatment': nn.LayerNorm(gene_embed_dim),
+                'ffn_control': nn.Sequential(
+                    nn.Linear(gene_embed_dim, gene_embed_dim * 2),
+                    nn.SiLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(gene_embed_dim * 2, gene_embed_dim),
+                    nn.Dropout(dropout)
+                ),
+                'ffn_treatment': nn.Sequential(
+                    nn.Linear(gene_embed_dim, gene_embed_dim * 2),
+                    nn.SiLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(gene_embed_dim * 2, gene_embed_dim),
+                    nn.Dropout(dropout)
+                )
+            }) for _ in range(num_cross_attention_layers)
+        ])
+        
+        # Pooling for each condition
+        self.pooling_attention = nn.Sequential(
+            nn.Linear(gene_embed_dim, 1),
+            nn.Tanh()
+        )
+        
+        # Final encoder layers for combined representation
+        pooled_dim = gene_embed_dim * 2  # Both control and treatment pooled features
+        layers = []
+        prev_dim = pooled_dim
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.LayerNorm(prev_dim),
+                ResidualBlock(prev_dim, hidden_dim, dropout)
+            ])
+            prev_dim = hidden_dim
+        
+        self.encoder = nn.Sequential(*layers)
+        
+        # Final projection
+        self.final_encoder = nn.Sequential(
+            nn.LayerNorm(prev_dim),
+            nn.Linear(prev_dim, output_dim),
+            nn.Dropout(dropout),
+            nn.LayerNorm(output_dim)
+        )
+
+         # Add separate projectors if needed
+        if enable_separate_outputs:
+            self.control_projector = nn.Sequential(
+                nn.LayerNorm(gene_embed_dim),
+                nn.Linear(gene_embed_dim, output_dim // 2),
+                nn.Dropout(dropout),
+                nn.LayerNorm(output_dim // 2)
+            )
+            self.treatment_projector = nn.Sequential(
+                nn.LayerNorm(gene_embed_dim),
+                nn.Linear(gene_embed_dim, output_dim // 2),
+                nn.Dropout(dropout),
+                nn.LayerNorm(output_dim // 2)
+            )
+        else:
+            self.control_projector = None
+            self.treatment_projector = None
+
+    def apply_self_attention(self, x):
+        """Apply self-attention within condition."""
+        for layer in self.self_attention_layers:
+            attn_out, _ = layer['attention'](x)
+            x = layer['norm1'](x + attn_out)
+            
+            ffn_out = layer['ffn'](x)
+            x = layer['norm2'](x + ffn_out)
+        return x
+
+    def apply_cross_attention(self, control_genes, treatment_genes):
+        """Apply cross-attention between conditions."""
+        cross_attn_weights = []
+        
+        for layer in self.cross_attention_layers:
+            # Control genes attend to treatment genes
+            control_cross_out, control_cross_weights = layer['control_to_treatment'](control_genes, treatment_genes)
+            control_genes = layer['norm_control'](control_genes + control_cross_out)
+            control_ffn_out = layer['ffn_control'](control_genes)
+            control_genes = layer['norm_control'](control_genes + control_ffn_out)
+            
+            # Treatment genes attend to control genes (if bidirectional)
+            if self.use_bidirectional_cross_attn and layer['treatment_to_control'] is not None:
+                treatment_cross_out, treatment_cross_weights = layer['treatment_to_control'](treatment_genes, control_genes)
+                treatment_genes = layer['norm_treatment'](treatment_genes + treatment_cross_out)
+                treatment_ffn_out = layer['ffn_treatment'](treatment_genes)
+                treatment_genes = layer['norm_treatment'](treatment_genes + treatment_ffn_out)
+                
+                cross_attn_weights.append({
+                    'control_to_treatment': control_cross_weights,
+                    'treatment_to_control': treatment_cross_weights
+                })
+            else:
+                cross_attn_weights.append({
+                    'control_to_treatment': control_cross_weights
+                })
+        
+        return control_genes, treatment_genes, cross_attn_weights
+
+    def pool_gene_features(self, x):
+        """Pool gene features to get condition-level representation."""
+        attn_weights = self.pooling_attention(x)  # [B, N, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
+        return (x * attn_weights).sum(dim=1)  # [B, embed_dim]
+
+    def forward(self, control_rna, treatment_rna, return_separate=True):
+        """
+        Forward pass with gene-to-gene cross-attention.
+        
+        Args:
+            control_rna: [batch_size, num_genes] - control condition gene expressions
+            treatment_rna: [batch_size, num_genes] - treatment condition gene expressions
+            return_separate: If True, return separate control and treatment representations
+        
+        Returns:
+            If return_separate=False: final_embeddings: [batch_size, output_dim] - combined representation
+            If return_separate=True: (control_features, treatment_features) each [batch_size, output_dim//2]
+        """
+        batch_size, num_genes = control_rna.shape
+        
+        # Embed genes for both conditions
+        control_reshaped = control_rna.unsqueeze(-1)  # [B, G, 1]
+        treatment_reshaped = treatment_rna.unsqueeze(-1)  # [B, G, 1]
+        
+        control_gene_embeds = self.gene_embedding(control_reshaped)  # [B, G, embed_dim]
+        treatment_gene_embeds = self.gene_embedding(treatment_reshaped)  # [B, G, embed_dim]
+        
+        # Apply self-attention within each condition
+        control_self_attended = self.apply_self_attention(control_gene_embeds)
+        treatment_self_attended = self.apply_self_attention(treatment_gene_embeds)
+        
+        # Apply cross-attention between conditions
+        control_cross_attended, treatment_cross_attended, cross_attn_weights = self.apply_cross_attention(
+            control_self_attended, treatment_self_attended
+        )
+        
+        # Pool each condition to get sample-level representations
+        control_pooled = self.pool_gene_features(control_cross_attended)  # [B, embed_dim]
+        treatment_pooled = self.pool_gene_features(treatment_cross_attended)  # [B, embed_dim]
+        
+        if return_separate:
+            # Project to desired output dimensions
+            control_features = self.control_projector(control_pooled)
+            treatment_features = self.treatment_projector(treatment_pooled)
+            return control_features, treatment_features
+        else:
+            # Combine both representations (original behavior)
+            combined_features = torch.cat([control_pooled, treatment_pooled], dim=-1)  # [B, 2*embed_dim]
+            
+            # Pass through encoder layers
+            encoded_features = self.encoder(combined_features)
+            
+            # Final projection
+            final_embeddings = self.final_encoder(encoded_features)
+            
+            return final_embeddings
+            
+    def get_cross_attention_weights(self, control_rna, treatment_rna, gene_names=None):
+        """
+        Get cross-attention weights for interpretability - shows which control genes attend to which treatment genes.
+        
+        Args:
+            control_rna: [batch_size, num_genes] 
+            treatment_rna: [batch_size, num_genes]
+            gene_names: List of gene names/IDs for interpretation (optional)
+            
+        Returns:
+            Dictionary with attention weights and interpretation utilities
+        """
+        with torch.no_grad():
+            batch_size, num_genes = control_rna.shape
+            
+            # Embed genes
+            control_reshaped = control_rna.unsqueeze(-1)
+            treatment_reshaped = treatment_rna.unsqueeze(-1)
+            
+            control_gene_embeds = self.gene_embedding(control_reshaped)
+            treatment_gene_embeds = self.gene_embedding(treatment_reshaped)
+            
+            # Apply self-attention
+            control_self_attended = self.apply_self_attention(control_gene_embeds)
+            treatment_self_attended = self.apply_self_attention(treatment_gene_embeds)
+            
+            # Get cross-attention weights
+            _, _, cross_attn_weights = self.apply_cross_attention(control_self_attended, treatment_self_attended)
+            
+            # Process attention weights for interpretability
+            result = {
+                'raw_weights': cross_attn_weights,
+                'gene_names': gene_names,
+                'num_genes': num_genes,
+                'batch_size': batch_size
+            }
+            
+            # Aggregate attention weights across heads and layers
+            aggregated_weights = self._aggregate_attention_weights(cross_attn_weights)
+            result['aggregated_weights'] = aggregated_weights
+            
+            # Find most important gene pairs
+            top_gene_pairs = self._find_top_gene_pairs(aggregated_weights, gene_names, top_k=20)
+            result['top_gene_pairs'] = top_gene_pairs
+            
+            return result
+    
+    def _aggregate_attention_weights(self, cross_attn_weights):
+        """Aggregate attention weights across layers and heads."""
+        aggregated = {}
+        
+        for direction in ['control_to_treatment', 'treatment_to_control']:
+            if direction in cross_attn_weights[0]:
+                # Stack weights from all layers: [num_layers, batch, num_heads, num_genes, num_genes]
+                stacked_weights = torch.stack([layer[direction] for layer in cross_attn_weights])
+                
+                # Average across layers and heads: [batch, num_genes, num_genes]
+                avg_weights = stacked_weights.mean(dim=[0, 2]).cpu()
+                aggregated[direction] = avg_weights
+                
+        return aggregated
+    
+    def _find_top_gene_pairs(self, aggregated_weights, gene_names=None, top_k=20):
+        """Find the most important gene pairs for drug identification, separating same-gene and cross-gene relationships."""
+        results = {}
+        
+        for direction, weights in aggregated_weights.items():
+            batch_results = []
+            
+            for batch_idx in range(weights.shape[0]):
+                sample_weights = weights[batch_idx]  # [num_genes, num_genes]
+                
+                # Separate diagonal (same-gene) and off-diagonal (cross-gene) weights
+                diagonal_mask = torch.eye(sample_weights.shape[0], dtype=torch.bool)
+                off_diagonal_mask = ~diagonal_mask
+                
+                # Get same-gene relationships (diagonal)
+                diagonal_weights = sample_weights[diagonal_mask]
+                diagonal_indices = torch.arange(sample_weights.shape[0])
+                top_diagonal_indices = torch.topk(diagonal_weights, min(top_k//2, len(diagonal_weights))).indices
+                
+                # Get cross-gene relationships (off-diagonal) 
+                off_diagonal_weights = sample_weights[off_diagonal_mask]
+                off_diagonal_coords = torch.nonzero(off_diagonal_mask, as_tuple=False)
+                top_off_diagonal_indices = torch.topk(off_diagonal_weights, min(top_k//2, len(off_diagonal_weights))).indices
+                
+                # Process same-gene pairs (corrected for drug identification)
+                same_gene_pairs = []
+                for idx in top_diagonal_indices:
+                    gene_idx = diagonal_indices[idx].item()
+                    weight_value = diagonal_weights[idx].item()
+                    
+                    if gene_names is not None:
+                        gene_name = gene_names[gene_idx]
+                        if direction == 'control_to_treatment':
+                            pair_info = {
+                                'control_gene': gene_name,
+                                'treatment_gene': gene_name,
+                                'attention_weight': weight_value,
+                                'is_same_gene': True,
+                                'interpretation': f"{gene_name} change pattern",
+                                'biological_meaning': "This gene's change pattern is diagnostic for drug identification"
+                            }
+                        else:
+                            pair_info = {
+                                'treatment_gene': gene_name,
+                                'control_gene': gene_name,
+                                'attention_weight': weight_value,
+                                'is_same_gene': True,
+                                'interpretation': f"{gene_name} response signature",
+                                'biological_meaning': "This gene's response signature helps identify the drug"
+                            }
+                    else:
+                        if direction == 'control_to_treatment':
+                            pair_info = {
+                                'control_gene_idx': gene_idx,
+                                'treatment_gene_idx': gene_idx,
+                                'attention_weight': weight_value,
+                                'is_same_gene': True,
+                                'interpretation': f"Gene_{gene_idx} change pattern"
+                            }
+                        else:
+                            pair_info = {
+                                'treatment_gene_idx': gene_idx,
+                                'control_gene_idx': gene_idx,
+                                'attention_weight': weight_value,
+                                'is_same_gene': True,
+                                'interpretation': f"Gene_{gene_idx} response signature"
+                            }
+                    
+                    same_gene_pairs.append(pair_info)
+                
+                # Process cross-gene pairs (corrected for drug identification)
+                cross_gene_pairs = []
+                for idx in top_off_diagonal_indices:
+                    coord_idx = off_diagonal_coords[idx]
+                    i, j = coord_idx[0].item(), coord_idx[1].item()
+                    weight_value = off_diagonal_weights[idx].item()
+                    
+                    if gene_names is not None:
+                        if direction == 'control_to_treatment':
+                            pair_info = {
+                                'control_gene': gene_names[i],
+                                'treatment_gene': gene_names[j],
+                                'attention_weight': weight_value,
+                                'is_same_gene': False,
+                                'interpretation': f"{gene_names[i]} baseline ↔ {gene_names[j]} response",
+                                'biological_meaning': "This cross-gene pattern is a distinctive drug signature"
+                            }
+                        else:
+                            pair_info = {
+                                'treatment_gene': gene_names[i],
+                                'control_gene': gene_names[j],
+                                'attention_weight': weight_value,
+                                'is_same_gene': False,
+                                'interpretation': f"{gene_names[i]} response ↔ {gene_names[j]} baseline",
+                                'biological_meaning': "This cross-gene relationship helps distinguish drugs"
+                            }
+                    else:
+                        if direction == 'control_to_treatment':
+                            pair_info = {
+                                'control_gene_idx': i,
+                                'treatment_gene_idx': j,
+                                'attention_weight': weight_value,
+                                'is_same_gene': False,
+                                'interpretation': f"Gene_{i} baseline ↔ Gene_{j} response"
+                            }
+                        else:
+                            pair_info = {
+                                'treatment_gene_idx': i,
+                                'control_gene_idx': j,
+                                'attention_weight': weight_value,
+                                'is_same_gene': False,
+                                'interpretation': f"Gene_{i} response ↔ Gene_{j} baseline"
+                            }
+                    
+                    cross_gene_pairs.append(pair_info)
+                
+                # Combine and sort all pairs by attention weight
+                all_pairs = same_gene_pairs + cross_gene_pairs
+                all_pairs.sort(key=lambda x: x['attention_weight'], reverse=True)
+                
+                batch_results.append({
+                    'all_pairs': all_pairs[:top_k],
+                    'same_gene_pairs': same_gene_pairs,
+                    'cross_gene_pairs': cross_gene_pairs
+                })
+            
+            results[direction] = batch_results
+            
+        return results
+
 class ResBlock(nn.Module):
     """ResNet-style residual block for image processing"""
     def __init__(self, in_channels, out_channels, stride=1):
@@ -333,3 +774,41 @@ class ImageEncoder(nn.Module):
         x = self.global_pool(x)  # [B, 512, 1, 1]
         x = x.view(x.size(0), -1)  # [B, 512]
         return self.head(x)  # [B, output_dim]
+
+def dual_rna_image_encoder_separate(control_images, treatment_images, control_rna, treatment_rna, 
+                                   image_encoder, rna_encoder, device):
+    """
+    Encode paired control and treatment data maintaining separate representations.
+    
+    This approach:
+    - Learns gene-to-gene mappings via cross-attention
+    - Maintains separate control and treatment feature vectors
+    - Useful when your downstream model expects distinct control/treatment inputs
+    
+    Output: Stack of [control_features, treatment_features] where each has been enhanced by cross-attention
+    """
+    # Encode images separately
+    control_img_features = image_encoder(control_images.to(device))
+    treatment_img_features = image_encoder(treatment_images.to(device))
+    
+    underlying_rna_encoder = rna_encoder.module if hasattr(rna_encoder, 'module') else rna_encoder
+    
+    if hasattr(underlying_rna_encoder, 'apply_cross_attention'):
+        # Use PairedRNAEncoder to get separate cross-attended representations
+        control_rna_features, treatment_rna_features = rna_encoder(
+            control_rna.to(device), treatment_rna.to(device), return_separate=True
+        )
+    else:
+        # Fallback to old RNAEncoder (no cross-attention)
+        control_rna_features = rna_encoder(control_rna.to(device))
+        treatment_rna_features = rna_encoder(treatment_rna.to(device))
+    
+    # Concatenate image and RNA features for each condition
+    control_features = torch.cat([control_img_features, control_rna_features], dim=-1)
+    treatment_features = torch.cat([treatment_img_features, treatment_rna_features], dim=-1)
+    
+    # Stack to maintain separate identities: [batch, 2, feature_dim]
+    combined_features = torch.stack([control_features, treatment_features], dim=1)
+    attention_mask = torch.ones(combined_features.size(0), 2, dtype=torch.bool, device=device)
+    
+    return combined_features, attention_mask
