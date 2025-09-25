@@ -806,7 +806,7 @@ class RawDrugDataset(DatasetWithDrugs):
         self.compound_name_label = compound_name_label
         self.raw_drug_df = pd.read_csv(raw_drug_csv_path)
         logger.info(f"Loaded {len(self.raw_drug_df)} raw drug entries from {raw_drug_csv_path}")
-        logger.info(f"self.raw_drug_df.head()=\n{self.raw_drug_df.head()}")
+        logger.debug(f"self.raw_drug_df.head()=\n{self.raw_drug_df.head()}")
 
         # Create drug name to SMILES mapping
         self.drug_name_to_smiles = {}

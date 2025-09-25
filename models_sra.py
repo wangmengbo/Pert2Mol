@@ -354,17 +354,22 @@ def compute_sra_loss(student_repr, teacher_repr, projection_head, distance_type=
 def pert2molSRA(**kwargs):
     return ReTSRA(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
+
 def ReT_XL_2_SRA(**kwargs):
     return ReTSRA(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+
 
 def ReT_XL_4_SRA(**kwargs):
     return ReTSRA(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
+
 def ReT_L_2_SRA(**kwargs):
     return ReTSRA(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
+
 def ReT_B_2_SRA(**kwargs):
     return ReTSRA(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+
 
 ReT_SRA_models = {
     'pert2molSRA': pert2molSRA,

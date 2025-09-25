@@ -918,7 +918,7 @@ def create_leak_free_dataloaders(
     train_metadata_drug = prepare_metadata_for_dataset(train_combinations)
     test_metadata_drug = prepare_metadata_for_dataset(test_combinations)
     logger.info(f"Final train metadata samples: {len(train_metadata_drug)}")
-    logger.info(f"train_metadata_drug.head():\n{train_metadata_drug.head()}")
+    logger.debug(f"train_metadata_drug.head():\n{train_metadata_drug.head()}")
     logger.info(f"Final test metadata samples: {len(test_metadata_drug)}")
 
     # Create dataloaders (you'll need to import create_raw_drug_dataloader)

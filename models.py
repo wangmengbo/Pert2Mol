@@ -10,8 +10,10 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from timm.layers import use_fused_attn
 import einops
 
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
 
 class CrossAttention(nn.Module):
     fused_attn: Final[bool]
@@ -76,6 +78,7 @@ class CrossAttention(nn.Module):
         # print('cross', x.shape, y.shape, pad_mask.shape, pad_mask[0])
         return x
 
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -115,6 +118,7 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -137,6 +141,7 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
 
 class ReTBlock(nn.Module):
     """Replace your ReTBlock class"""
@@ -201,6 +206,7 @@ class FinalLayer(nn.Module):
         x = modulate_rms(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
+
 
 class ReT(nn.Module):
     """
@@ -325,6 +331,7 @@ class ReT(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
 
+
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """
     grid_size: int of the grid height and width
@@ -343,6 +350,7 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
+
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
 
@@ -352,6 +360,7 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
 
     emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
+
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -372,6 +381,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
 
 def pert2mol(**kwargs):
     return ReT(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
@@ -432,3 +442,4 @@ ReT_models = {
     'ReT-B/2': ReT_B_2, 'ReT-B/4': ReT_B_4, 'ReT-B/8': ReT_B_8,
     'ReT-S/2': ReT_S_2, 'ReT-S/4': ReT_S_4, 'ReT-S/8': ReT_S_8,
 }
+

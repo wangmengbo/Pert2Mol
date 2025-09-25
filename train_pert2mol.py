@@ -32,10 +32,9 @@ from pathlib import Path
 from models import ReT_models
 from models_sra import ReT_SRA_models, EMAManager, compute_sra_loss
 from train_autoencoder import pert2mol_autoencoder
-from utils import (
+from utils import (save_emergency_checkpoint,
     AE_SMILES_encoder, regexTokenizer, get_hash,
-    setup_signal_handlers, save_emergency_checkpoint, 
-    find_latest_checkpoint, load_checkpoint_and_resume,
+    find_latest_checkpoint, load_checkpoint_and_resume, load_checkpoint_and_resume_specified,
     EarlyStopping
     )
 from encoders import ImageEncoder, RNAEncoder, PairedRNAEncoder
@@ -48,11 +47,8 @@ from dataloaders.dataset_tahoe import create_tahoe_dataloaders
 from dataloaders.download import download_model, find_model
 from diffusion.rectified_flow import create_rectified_flow
 
-GRACEFUL_SHUTDOWN = False
-CHECKPOINT_DIR = None
-CURRENT_STEP = 0
-EXPERIMENT_DIR = None
-AUTO_REQUEUE = False
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 def cleanup():
@@ -213,7 +209,9 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
     return x
 
 
-def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_encoder, device, use_ddp, rank, args, sra_teacher_manager=None, max_batches=100):
+def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_encoder, 
+                   device, use_ddp, rank, args, sra_teacher_manager=None, 
+                   has_rna=True, has_imaging=True, max_batches=100):    
     """Run validation and return average losses"""
     # Store original training states
     model_training = model.training
@@ -245,7 +243,7 @@ def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_e
 
                     y, pad_mask = dual_rna_image_encoder(
                         control_imgs, treatment_imgs, control_rna, treatment_rna,
-                        image_encoder, rna_encoder, device
+                        image_encoder, rna_encoder, device, has_rna, has_imaging
                     )
 
                     model_kwargs = dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
@@ -350,6 +348,7 @@ def main(args):
     """
     Trains a new ReT model with SRA enhancement and flexible single/multi-GPU support.
     Enhanced with signal handling, auto-resume capability, and early stopping.
+    Supports both single and dual modality training.
     """
     global create_data_loader, gene_count_matrix, metadata_control, metadata_drug
 
@@ -367,7 +366,7 @@ def main(args):
 
             rank = dist.get_rank()
             device = rank % torch.cuda.device_count()
-            seed = args.global_seed * dist.get_world_size() + rank
+            seed = args.seed * dist.get_world_size() + rank
             torch.manual_seed(seed)
             torch.cuda.set_device(device)
             
@@ -403,7 +402,7 @@ def main(args):
             # Single GPU training
             device = torch.device("cuda:0")
             rank = 0
-            seed = args.global_seed
+            seed = args.seed
             torch.manual_seed(seed)
             torch.cuda.set_device(0)
             
@@ -437,10 +436,6 @@ def main(args):
             
             use_ddp = False
             batch_size = args.batch_size
-
-        # Setup signal handlers (only on rank 0 to avoid duplicate requeue attempts)
-        if not use_ddp or rank == 0:
-            setup_signal_handlers(checkpoint_dir, experiment_dir, args.auto_resume)
         
         # Initialize early stopping
         early_stopping = None
@@ -454,6 +449,22 @@ def main(args):
             )
             if not use_ddp or rank == 0:
                 logger.info(f"Early stopping enabled: patience={args.early_stopping_patience}, min_delta={args.early_stopping_min_delta}")
+        
+        # DETECT AVAILABLE MODALITIES
+        has_rna = gene_count_matrix is not None and len(gene_count_matrix) > 0
+        has_imaging = args.image_json_path is not None and os.path.exists(args.image_json_path)
+        
+        if not has_rna and not has_imaging:
+            raise ValueError("At least one modality (RNA or imaging) must be available")
+        
+        modality_info = []
+        if has_rna:
+            modality_info.append("RNA")
+        if has_imaging:
+            modality_info.append("Imaging")
+            
+        if not use_ddp or rank == 0:
+            logger.info(f"Detected modalities: {' + '.join(modality_info)}")
         
         latent_size = 127
         in_channels = 64
@@ -470,13 +481,6 @@ def main(args):
             sra_layer_teacher=args.sra_layer_teacher,
             sra_projection_dim=args.sra_projection_dim
         )
-
-        if args.ckpt:
-            ckpt_path = args.ckpt
-            state_dict = find_model(ckpt_path)
-            msg = model.load_state_dict(state_dict, strict=False)  # strict=False for SRA compatibility
-            if not use_ddp or rank == 0:
-                logger.info('load ReT from ', ckpt_path, msg)
 
         # Setup model for distributed or single GPU
         ema = deepcopy(model).to(device)
@@ -527,71 +531,115 @@ def main(args):
 
         logger.info(f"ReT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-        # Setup image encoder
-        image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
-        if use_ddp:
-            image_encoder = DDP(image_encoder, device_ids=[rank], find_unused_parameters=True)
+        # Setup encoders based on available modalities - FIX: Handle None cases properly
+        image_encoder = None
+        rna_encoder = None
         
-        for param in image_encoder.parameters():
-            param.requires_grad = True
-        image_encoder.train()
-        if not use_ddp or rank == 0:
-            logger.info(f'ImageEncoder #parameters: {sum(p.numel() for p in image_encoder.parameters())}, #trainable: {sum(p.numel() for p in image_encoder.parameters() if p.requires_grad)}')
-
-        # Setup rna encoder
-        if args.paired_rna_encoder:
-            rna_encoder = PairedRNAEncoder(
-                input_dim=gene_count_matrix.shape[0], 
-                output_dim=128, 
-                dropout=0.1, 
-                num_heads=4, 
-                gene_embed_dim=512, 
-                num_self_attention_layers=1, 
-                num_cross_attention_layers=2,
-                use_bidirectional_cross_attn=True
-            ).to(device)
+        if has_imaging:
+            image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
+            if use_ddp:
+                image_encoder = DDP(image_encoder, device_ids=[rank], find_unused_parameters=True)
+            
+            for param in image_encoder.parameters():
+                param.requires_grad = True
+            image_encoder.train()
+            if not use_ddp or rank == 0:
+                logger.info(f'ImageEncoder #parameters: {sum(p.numel() for p in image_encoder.parameters())}, #trainable: {sum(p.numel() for p in image_encoder.parameters() if p.requires_grad)}')
         else:
-            rna_encoder = RNAEncoder(input_dim=gene_count_matrix.shape[0], output_dim=64, dropout=0.1).to(device)
+            if not use_ddp or rank == 0:
+                logger.info('Skipping ImageEncoder - no imaging data available')
 
-        if use_ddp:
-            rna_encoder = DDP(rna_encoder, device_ids=[rank], find_unused_parameters=True)
-        for param in rna_encoder.parameters():
-            param.requires_grad = True
-        rna_encoder.train()
-        if not use_ddp or rank == 0:
-            logger.info(f'RNAEncoder #parameters: {sum(p.numel() for p in rna_encoder.parameters())}, #trainable: {sum(p.numel() for p in rna_encoder.parameters() if p.requires_grad)}')
+        if has_rna:
+            if args.paired_rna_encoder:
+                rna_encoder = PairedRNAEncoder(
+                    input_dim=gene_count_matrix.shape[0], 
+                    output_dim=128, 
+                    dropout=0.1, 
+                    num_heads=4, 
+                    gene_embed_dim=512, 
+                    num_self_attention_layers=1, 
+                    num_cross_attention_layers=2,
+                    use_bidirectional_cross_attn=True
+                ).to(device)
+            else:
+                rna_encoder = RNAEncoder(input_dim=gene_count_matrix.shape[0], output_dim=64, dropout=0.1).to(device)
 
-        # Create optimizer
-        if use_ddp:
-            all_params = list(model.parameters()) + list(image_encoder.parameters()) + list(rna_encoder.parameters())
+            if use_ddp:
+                rna_encoder = DDP(rna_encoder, device_ids=[rank], find_unused_parameters=True)
+            for param in rna_encoder.parameters():
+                param.requires_grad = True
+            rna_encoder.train()
+            if not use_ddp or rank == 0:
+                logger.info(f'RNAEncoder #parameters: {sum(p.numel() for p in rna_encoder.parameters())}, #trainable: {sum(p.numel() for p in rna_encoder.parameters() if p.requires_grad)}')
         else:
-            all_params = list(model.parameters()) + list(image_encoder.parameters()) + list(rna_encoder.parameters())
+            if not use_ddp or rank == 0:
+                logger.info('Skipping RNAEncoder - no RNA data available')
+
+        # Create optimizer with only available encoders - FIX: Handle None encoders
+        model_params = list(model.parameters())
+        if image_encoder is not None:
+            model_params.extend(list(image_encoder.parameters()))
+        if rna_encoder is not None:
+            model_params.extend(list(rna_encoder.parameters()))
 
         if not use_ddp or rank == 0:
-            logger.info(f"Total parameters: {sum(p.numel() for p in all_params):,}, trainable: {sum(p.numel() for p in all_params if p.requires_grad):,}")
-        opt = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=0)
+            logger.info(f"Total parameters: {sum(p.numel() for p in model_params):,}, trainable: {sum(p.numel() for p in model_params if p.requires_grad):,}")
+        opt = torch.optim.AdamW(model_params, lr=args.lr, weight_decay=0)
 
-        # Check for existing checkpoints and resume if found
+        # FIXED: Create learning rate scheduler BEFORE checkpoint loading
+        # Use temporary total_steps for schedulers that need it
+        temp_total_steps = args.epochs * 1000  # Will be updated after data loading
+        scheduler = None
+        
+        if args.scheduler == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=args.step_size, gamma=args.gamma)
+        elif args.scheduler == "exponential":
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=args.gamma)
+        elif args.scheduler == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=temp_total_steps, eta_min=args.min_lr)
+        elif args.scheduler == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=args.plateau_factor, 
+                                                                patience=args.plateau_patience, verbose=True)
+        elif args.scheduler == "linear":
+            scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=args.min_lr/args.lr, 
+                                                        total_iters=temp_total_steps)
+
+        if not use_ddp or rank == 0:
+            logger.info(f"Created {args.scheduler} learning rate scheduler")
+            
+        # FIXED: Check for existing checkpoints and resume if found
         resume_step = 0
+        checkpoint_used = None
+        
         if not use_ddp or rank == 0:
-            latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
-            if latest_checkpoint and not args.ckpt and args.auto_resume:  # Don't auto-resume if explicit checkpoint specified
-                resume_step = load_checkpoint_and_resume(
-                    latest_checkpoint, model, image_encoder, rna_encoder, ema, opt,
-                    sra_teacher_manager, use_ddp, rank, logger
+            if args.ckpt:
+                # Load from specified checkpoint
+                resume_step = load_checkpoint_and_resume_specified(
+                    args.ckpt, model, image_encoder, rna_encoder, ema, opt,
+                    sra_teacher_manager, use_ddp, rank, logger, scheduler
                 )
-                
-                # Also load early stopping state if available
-                if early_stopping is not None:
-                    try:
-                        checkpoint = torch.load(latest_checkpoint, map_location='cpu')
-                        if "early_stopping" in checkpoint:
-                            early_stopping.load_state_dict(checkpoint["early_stopping"])
-                            if not use_ddp or rank == 0:
-                               logger.info(f"[RESUME] Loaded early stopping state: best_score={early_stopping.best_score:.6f}")
-                    except Exception as e:
+                checkpoint_used = args.ckpt
+            elif args.auto_resume:
+                # Auto-resume from latest checkpoint
+                latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+                if latest_checkpoint:
+                    resume_step = load_checkpoint_and_resume(
+                        latest_checkpoint, model, image_encoder, rna_encoder, ema, opt,
+                        sra_teacher_manager, use_ddp, rank, logger, scheduler
+                    )
+                    checkpoint_used = latest_checkpoint
+            
+            # Load additional states (early stopping) for both cases
+            if checkpoint_used and early_stopping is not None:
+                try:
+                    checkpoint = torch.load(checkpoint_used, map_location='cpu')
+                    if "early_stopping" in checkpoint:
+                        early_stopping.load_state_dict(checkpoint["early_stopping"])
                         if not use_ddp or rank == 0:
-                            logger.warning(f"[RESUME] Failed to load early stopping state: {e}")
+                           logger.info(f"[RESUME] Loaded early stopping state: best_score={early_stopping.best_score:.6f}")
+                except Exception as e:
+                    if not use_ddp or rank == 0:
+                        logger.warning(f"[RESUME] Failed to load early stopping state: {e}")
 
         # Broadcast resume_step to all processes
         if use_ddp:
@@ -619,7 +667,7 @@ def main(args):
                 include_drugs=args.include_drugs,
                 debug_mode=args.debug_mode,
                 debug_samples=args.debug_samples,
-                random_state=args.random_state,
+                random_state=args.seed,
                 split_train_test=True,
                 test_size=args.test_size,
                 return_datasets=True,
@@ -644,7 +692,7 @@ def main(args):
                 sampler=train_sampler,
                 num_workers=args.num_workers,
                 pin_memory=True,
-                persistent_workers=True  # Add this to keep workers alive
+                persistent_workers=True
             )
             test_loader = DataLoader(
                 test_dataset,
@@ -652,7 +700,7 @@ def main(args):
                 sampler=test_sampler,
                 num_workers=args.num_workers,
                 pin_memory=True,
-                persistent_workers=True  # Add this to keep workers alive
+                persistent_workers=True
             )
         else:
             train_loader, test_loader = create_data_loader(
@@ -675,11 +723,40 @@ def main(args):
                 include_drugs=args.include_drugs,
                 debug_mode=args.debug_mode,
                 debug_samples=args.debug_samples,
-                random_state=args.random_state,
+                random_state=args.seed,
                 split_train_test=True,
                 test_size=args.test_size,
             )
 
+        # FIXED: Update scheduler with actual total_steps after data loading
+        if scheduler is not None and args.scheduler in ["cosine", "linear"]:
+            # Now we know the actual total steps
+            actual_total_steps = args.epochs * len(train_loader)
+            
+            if args.scheduler == "cosine":
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=actual_total_steps, eta_min=args.min_lr)
+            elif args.scheduler == "linear":
+                scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1.0, end_factor=args.min_lr/args.lr, 
+                                                            total_iters=actual_total_steps)
+            
+            # Reload scheduler state if we resumed from checkpoint
+            if resume_step > 0 and checkpoint_used:
+                if args.disable_resume_scheduler:
+                    if not use_ddp or rank == 0:
+                        logger.info("[RESUME] Skipping scheduler state reload as per user request (--disable_resume_scheduler)")
+                else:
+                    try:
+                        checkpoint = torch.load(checkpoint_used, map_location='cpu')
+                        if "scheduler" in checkpoint and (not use_ddp or rank == 0):
+                            scheduler.load_state_dict(checkpoint["scheduler"])
+                            logger.info(f"[RESUME] Reloaded scheduler state with correct total_steps ({actual_total_steps})")
+                    except Exception as e:
+                        if not use_ddp or rank == 0:
+                            logger.warning(f"[RESUME] Failed to reload scheduler state: {e}")
+
+        if not use_ddp or rank == 0:
+            logger.info(f"Using {args.scheduler} learning rate scheduler")
+            
         # Prepare models for training
         if use_ddp:
             update_ema(ema, model.module, decay=0)
@@ -695,20 +772,14 @@ def main(args):
         running_flow_loss = 0
         running_sra_loss = 0
         start_time = time()
-        validation_frequency = args.ckpt_every // 5  # Run validation 5 times per checkpoint cycle
+        validation_frequency = args.ckpt_every // 5
 
         logger.info(f"Training for {args.epochs} epochs, starting from step {resume_step}...")
         
         training_completed = False
         
         for epoch in range(args.epochs):
-            if GRACEFUL_SHUTDOWN:
-                if not use_ddp or rank == 0:
-                    logger.info("[SIGNAL] Graceful shutdown detected at start of epoch, exiting...")
-                break
-
             if use_ddp:
-                # Adjust epoch for sampler to account for resumed training
                 effective_epoch = epoch + (resume_step // len(train_loader))
                 train_sampler.set_epoch(effective_epoch)
             
@@ -723,16 +794,7 @@ def main(args):
                 if epoch == resume_epoch and batch_idx < resume_batch_idx:
                     continue
 
-                if GRACEFUL_SHUTDOWN:
-                    if not use_ddp or rank == 0:
-                        logger.info("[SIGNAL] Graceful shutdown initiated, saving checkpoint...")
-                        save_emergency_checkpoint(
-                            model, image_encoder, rna_encoder, ema, opt, args,
-                            sra_teacher_manager, train_steps, use_ddp, rank
-                        )
-                        logger.info("[SIGNAL] Emergency checkpoint saved, exiting...")
-                    break
-                
+                # Encode target molecules
                 with torch.no_grad():
                     target_smiles = batch['target_smiles']
                     x = AE_SMILES_encoder(target_smiles, ae_model).permute((0, 2, 1)).unsqueeze(-1)
@@ -744,7 +806,7 @@ def main(args):
 
                 y, pad_mask = dual_rna_image_encoder(
                     control_imgs, treatment_imgs, control_rna, treatment_rna,
-                    image_encoder, rna_encoder, device
+                    image_encoder, rna_encoder, device, has_rna, has_imaging
                 )
 
                 # CFG training with three conditioning variants
@@ -766,7 +828,7 @@ def main(args):
                 x_t = (1 - t_expanded) * current_noise + t_expanded * x
                 true_velocity = x - current_noise
 
-                # Forward pass for student (captures both output and SRA representation)
+                # Forward pass for student
                 student_output, student_repr = student_model.forward(
                     x_t, (current_t * (flow.num_timesteps - 1)).long(), 
                     y=y.type(torch.float32), pad_mask=pad_mask.bool()
@@ -781,13 +843,11 @@ def main(args):
                 # Flow loss
                 flow_loss = F.mse_loss(predicted_velocity, true_velocity)
 
-                # SRA loss computation using same timestep
+                # SRA loss computation
                 sra_loss = torch.tensor(0.0, device=device)
                 if args.use_sra and sra_teacher_manager is not None and student_repr is not None:
-                    # Sample timestep offset for teacher (lower noise)
                     teacher_timestep_offset = torch.randint(1, args.sra_timestep_offset_max + 1, (1,)).item()
                     
-                    # Get teacher representation (with lower noise)
                     teacher_model = sra_teacher_manager.get_teacher()
                     teacher_model.eval()
                     with torch.no_grad():
@@ -797,7 +857,6 @@ def main(args):
                             teacher_mode=True, teacher_timestep_offset=teacher_timestep_offset
                         )
                     
-                    # Compute SRA alignment loss
                     if teacher_repr is not None:
                         projection_head = student_model.sra_projection_head if hasattr(student_model, 'sra_projection_head') else student_model.module.sra_projection_head
                         sra_loss = compute_sra_loss(
@@ -805,20 +864,22 @@ def main(args):
                             distance_type=args.sra_distance_type
                         )
 
-                # Total loss
+                # Total loss and optimization
                 total_loss = flow_loss + args.sra_lambda * sra_loss
                 
                 opt.zero_grad()
                 total_loss.backward()
                 opt.step()
                 
-                # Update EMA networks
+                if scheduler is not None and args.scheduler != "plateau":
+                    scheduler.step()
+
+                # Update EMA and SRA teacher
                 if use_ddp:
                     update_ema(ema, model.module)
                 else:
                     update_ema(ema, model)
                     
-                # Update SRA teacher
                 if args.use_sra and sra_teacher_manager is not None:
                     if use_ddp:
                         sra_teacher_manager.update_teacher(model.module)
@@ -838,7 +899,6 @@ def main(args):
                     steps_per_sec = log_steps / (end_time - start_time)
                     
                     if use_ddp:
-                        # Reduce losses across all processes
                         avg_total_loss = torch.tensor(running_loss / log_steps, device=device)
                         avg_flow_loss = torch.tensor(running_flow_loss / log_steps, device=device)
                         avg_sra_loss = torch.tensor(running_sra_loss / log_steps, device=device)
@@ -856,10 +916,11 @@ def main(args):
                         avg_sra_loss = running_sra_loss / log_steps
                     
                     if not use_ddp or rank == 0:
+                        current_lr = opt.param_groups[0]['lr']
                         log_msg = f"(step={train_steps:07d}) Total Loss: {avg_total_loss:.4f}, Flow Loss: {avg_flow_loss:.4f}"
                         if args.use_sra:
                             log_msg += f", SRA Loss: {avg_sra_loss:.4f}"
-                        log_msg += f", Train Steps/Sec: {steps_per_sec:.2f}"
+                        log_msg += f", Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lr:.2e}"
                         logger.info(log_msg)
                         
                     running_loss = 0
@@ -871,32 +932,26 @@ def main(args):
                 # Save checkpoint
                 if train_steps % args.ckpt_every == 0 and train_steps > 0:
                     if not use_ddp or rank == 0:
-                        if use_ddp:
-                            checkpoint = {
-                                "model": model.module.state_dict(),
-                                "image_encoder": image_encoder.module.state_dict(),
-                                "rna_encoder": rna_encoder.module.state_dict(),
-                                "ema": ema.state_dict(),
-                                "opt": opt.state_dict(),
-                                "args": args,
-                                "train_steps": train_steps
-                            }
-                            if args.use_sra and sra_teacher_manager is not None:
-                                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
-                        else:
-                            checkpoint = {
-                                "model": model.state_dict(),
-                                "image_encoder": image_encoder.state_dict(),
-                                "rna_encoder": rna_encoder.state_dict(),
-                                "ema": ema.state_dict(),
-                                "opt": opt.state_dict(),
-                                "args": args,
-                                "train_steps": train_steps
-                            }
-                            if args.use_sra and sra_teacher_manager is not None:
-                                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+                        checkpoint = {
+                            "model": model.module.state_dict() if use_ddp else model.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "args": args,
+                            "train_steps": train_steps,
+                            "model_version": 2.0,
+                            "uses_dummy_tensors": False,
+                        }
                         
-                        # Add early stopping state
+                        if scheduler is not None:
+                            checkpoint["scheduler"] = scheduler.state_dict()
+                        if image_encoder is not None:
+                            checkpoint["image_encoder"] = image_encoder.module.state_dict() if use_ddp else image_encoder.state_dict()
+                        if rna_encoder is not None:
+                            checkpoint["rna_encoder"] = rna_encoder.module.state_dict() if use_ddp else rna_encoder.state_dict()
+                            
+                        if args.use_sra and sra_teacher_manager is not None:
+                            checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+                        
                         if early_stopping is not None:
                             checkpoint["early_stopping"] = early_stopping.state_dict()
                         
@@ -904,7 +959,6 @@ def main(args):
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
                         
-                        # Update latest.pt symlink
                         latest_path = f"{checkpoint_dir}/latest.pt"
                         if os.path.exists(latest_path):
                             os.remove(latest_path)
@@ -913,14 +967,15 @@ def main(args):
                     if use_ddp:
                         dist.barrier()
 
-                # Run validation periodically for early stopping
+                # Run validation
                 if train_steps % validation_frequency == 0 and train_steps > 0:
                     if not use_ddp or rank == 0:
                         logger.info("Running validation...")
                     
                     val_flow_loss, val_sra_loss = run_validation(
                         model, ema, test_loader, flow, ae_model, 
-                        image_encoder, rna_encoder, device, use_ddp, rank, args, sra_teacher_manager
+                        image_encoder, rna_encoder, device, use_ddp, rank, args, 
+                        sra_teacher_manager, has_rna, has_imaging
                     )
                     
                     if not use_ddp or rank == 0:
@@ -929,8 +984,15 @@ def main(args):
                         if args.use_sra:
                             val_msg += f", SRA Loss: {val_sra_loss:.4f}"
                         logger.info(val_msg)
+
+                        if scheduler is not None and args.scheduler == "plateau":
+                            scheduler.step(val_total_loss)
+                            
+                            # Log current learning rate
+                            current_lr = opt.param_groups[0]['lr']
+                            if not use_ddp or rank == 0:
+                                logger.info(f"Current learning rate: {current_lr:.2e}")
                         
-                        # Save validation metrics
                         val_metrics = {
                             'step': train_steps,
                             'val_total_loss': val_total_loss,
@@ -942,84 +1004,106 @@ def main(args):
                         with open(val_log_path, 'a') as f:
                             f.write(json.dumps(val_metrics) + '\n')
                         
-                        # Check early stopping
                         if early_stopping is not None:
+                            logger.info(f"Early stopping: wait={early_stopping.wait}/{early_stopping.patience}, "
+                                    f"best={early_stopping.best_score:.6f}, current={val_total_loss:.6f}")
+                            
                             should_stop = early_stopping(val_total_loss, model, train_steps)
+
                             if should_stop:
                                 logger.info(f"[EARLY_STOPPING] Training stopped early at step {train_steps}")
                                 
-                                # Save final checkpoint with best weights
-                                if use_ddp:
-                                    final_checkpoint = {
-                                        "model": model.module.state_dict(),
-                                        "image_encoder": image_encoder.module.state_dict(),
-                                        "rna_encoder": rna_encoder.module.state_dict(),
-                                        "ema": ema.state_dict(),
-                                        "opt": opt.state_dict(),
-                                        "args": args,
-                                        "train_steps": train_steps,
-                                        "early_stopping": early_stopping.state_dict(),
-                                        "early_stopped": True
-                                    }
-                                    if args.use_sra and sra_teacher_manager is not None:
-                                        final_checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
-                                else:
-                                    final_checkpoint = {
-                                        "model": model.state_dict(),
-                                        "image_encoder": image_encoder.state_dict(),
-                                        "rna_encoder": rna_encoder.state_dict(),
-                                        "ema": ema.state_dict(),
-                                        "opt": opt.state_dict(),
-                                        "args": args,
-                                        "train_steps": train_steps,
-                                        "early_stopping": early_stopping.state_dict(),
-                                        "early_stopped": True
-                                    }
-                                    if args.use_sra and sra_teacher_manager is not None:
-                                        final_checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+                                final_checkpoint = {
+                                    "model": model.module.state_dict() if use_ddp else model.state_dict(),
+                                    "ema": ema.state_dict(),
+                                    "opt": opt.state_dict(),
+                                    "args": args,
+                                    "train_steps": train_steps,
+                                    "early_stopping": early_stopping.state_dict(),
+                                    "early_stopped": True
+                                }
+
+                                if scheduler is not None:
+                                    final_checkpoint["scheduler"] = scheduler.state_dict()
+                                if image_encoder is not None:
+                                    final_checkpoint["image_encoder"] = image_encoder.module.state_dict() if use_ddp else image_encoder.state_dict()
+                                if rna_encoder is not None:
+                                    final_checkpoint["rna_encoder"] = rna_encoder.module.state_dict() if use_ddp else rna_encoder.state_dict()
+                                    
+                                if args.use_sra and sra_teacher_manager is not None:
+                                    final_checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
                                 
                                 final_path = f"{checkpoint_dir}/final_early_stopped_{train_steps:07d}.pt"
                                 torch.save(final_checkpoint, final_path)
                                 logger.info(f"Saved final early-stopped checkpoint to {final_path}")
                                 
-                                # Update latest.pt symlink to point to final checkpoint
                                 latest_path = f"{checkpoint_dir}/latest.pt"
                                 if os.path.exists(latest_path):
                                     os.remove(latest_path)
                                 os.symlink(os.path.basename(final_path), latest_path)
                                 
-                                break  # Exit training loop
+                                break
                     
                     if use_ddp:
                         dist.barrier()
                         
-                        # Broadcast early stopping decision to all processes
                         should_stop_tensor = torch.tensor(early_stopping.should_stop if early_stopping else False, device=device)
                         dist.broadcast(should_stop_tensor, src=0)
                         
                         if should_stop_tensor.item():
                             if rank != 0:
                                 logger.info(f"[EARLY_STOPPING] Received stop signal from rank 0")
-                            break  # Exit training loop on all processes
-            
-            # Check if we need to break from the outer epoch loop
-            if GRACEFUL_SHUTDOWN:
-                if not use_ddp or rank == 0:
-                    logger.info("[SIGNAL] Graceful shutdown completed, exiting training loop...")
-                break
+                            break
 
-            # Check for graceful shutdown or early stopping between epochs
             if early_stopping and early_stopping.should_stop:
                 break
         else:
-            # This else clause executes only if the for loop completed normally (not broken)
             training_completed = True
             if not use_ddp or rank == 0:
                 logger.info("Training completed all epochs successfully!")
 
+        if training_completed and (not use_ddp or rank == 0):
+            logger.info("Training completed all epochs. Saving final checkpoint...")
+            
+            checkpoint = {
+                "model": model.module.state_dict() if use_ddp else model.state_dict(),
+                "ema": ema.state_dict(),
+                "opt": opt.state_dict(),
+                "args": args,
+                "train_steps": train_steps,
+                "training_completed": True,
+                "model_version": 2.0,
+                "uses_dummy_tensors": False,
+            }
+
+            if scheduler is not None:
+                checkpoint["scheduler"] = scheduler.state_dict()
+            if image_encoder is not None:
+                checkpoint["image_encoder"] = image_encoder.module.state_dict() if use_ddp else image_encoder.state_dict()
+            if rna_encoder is not None:
+                checkpoint["rna_encoder"] = rna_encoder.module.state_dict() if use_ddp else rna_encoder.state_dict()
+                
+            if args.use_sra and sra_teacher_manager is not None:
+                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+            
+            if early_stopping is not None:
+                checkpoint["early_stopping"] = early_stopping.state_dict()
+            
+            final_path = f"{checkpoint_dir}/final_completed_{train_steps:07d}.pt"
+            torch.save(checkpoint, final_path)
+            logger.info(f"Saved final completion checkpoint to {final_path}")
+            
+            # Update latest.pt symlink
+            latest_path = f"{checkpoint_dir}/latest.pt"
+            if os.path.exists(latest_path):
+                os.remove(latest_path)
+            os.symlink(os.path.basename(final_path), latest_path)
+
+        if use_ddp:
+            dist.barrier()
+            
         model.eval()
         
-        # Clean up and ensure proper termination
         if not use_ddp or rank == 0:
             if training_completed:
                 logger.info("Training completed successfully. Cleaning up...")
@@ -1031,7 +1115,6 @@ def main(args):
             logger.error(f"Training failed with exception: {e}")
         raise e
     finally:
-        # CRITICAL: Proper cleanup to prevent hanging
         try:
             # Force cleanup of DataLoader workers
             if train_loader is not None:
@@ -1071,13 +1154,13 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="")
     parser.add_argument("--model", type=str, choices=list(ReT_SRA_models.keys()), default="pert2molSRA")
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--random-state", type=int, default=42, help="Random seed for data loading replicability")
-    parser.add_argument("--global-seed", type=int, default=42, help="Global random seed for DDP reproducibility")
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed for DDP reproducibility")
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt") 
-    parser.add_argument("--num-workers", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--ckpt-every", type=int, default=5000)
+    parser.add_argument("--ckpt-every", type=int, default=1000)
     parser.add_argument("--use-distributed", action="store_true", help="Enable distributed training across multiple GPUs")
     parser.add_argument("--prefix", type=str, default=None)
     parser.add_argument("--dataset", type=str, choices=["gdp", "gdp_rna", "gdp_image", "lincs_rna", "cpgjump", "tahoe", "other"], default="gdp")
@@ -1103,7 +1186,7 @@ if __name__ == "__main__":
     parser.add_argument("--include-drugs", type=str, nargs='+', default=None, help="Only use these drugs (overrides exclude)")
 
     parser.add_argument("--auto-resume", action="store_true", default=False, help="Automatically resume from latest checkpoint")
-    parser.add_argument("--early-stopping-patience", type=int, default=0, 
+    parser.add_argument("--early-stopping-patience", type=int, default=5, 
                     help="Number of validation checks without improvement before stopping (0 = disabled)")
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.001,
                     help="Minimum change to qualify as improvement for early stopping")
@@ -1123,11 +1206,28 @@ if __name__ == "__main__":
     parser.add_argument("--sra-distance-type", type=str, default="mse", choices=["mse", "cosine"], help="Distance function for SRA loss")
     parser.add_argument("--sra-timestep-offset-max", type=int, default=50, help="Maximum timestep offset for teacher (lower noise)")
 
+    parser.add_argument("--scheduler", type=str, default="cosine", 
+                    choices=["step", "exponential", "cosine", "plateau", "linear"], 
+                    help="Learning rate scheduler type")
+    parser.add_argument("--disable-resume-scheduler", action="store_true", default=False, 
+                        help="When resuming from checkpoint, do not load scheduler state")
+    parser.add_argument("--step-size", type=int, default=1000, 
+                        help="Step size for StepLR scheduler")
+    parser.add_argument("--gamma", type=float, default=0.95, 
+                        help="Decay factor for StepLR and ExponentialLR")
+    parser.add_argument("--min-lr", type=float, default=1e-7, 
+                        help="Minimum learning rate for cosine/linear schedulers")
+    parser.add_argument("--plateau-patience", type=int, default=10, 
+                        help="Patience for ReduceLROnPlateau scheduler")
+    parser.add_argument("--plateau-factor", type=float, default=0.5, 
+                        help="Factor for ReduceLROnPlateau scheduler")
+
     args = parser.parse_args()
     print(args)
     
     assert not (args.include_cell_lines and args.exclude_cell_lines), "Both --include-cell-lines and --exclude-cell-lines specified. Please choose one."
 
+    gene_count_matrix = None
     if args.gene_count_matrix_path is not None:
         gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
 
@@ -1135,6 +1235,8 @@ if __name__ == "__main__":
         create_data_loader = create_gdp_dataloaders
     elif args.dataset == "gdp_rna":
         create_data_loader = create_gdp_rna_dataloaders
+    elif args.dataset == "gdp_image":
+        create_data_loader = create_gdp_image_dataloaders
     elif args.dataset == "lincs_rna":
         create_data_loader = create_lincs_rna_dataloaders
         gene_count_matrix = gene_count_matrix.T

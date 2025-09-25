@@ -30,7 +30,7 @@ from time import time
 from pathlib import Path
 
 from models import ReT_models
-from models_sra import ReT_SRA_models, EMAManager, compute_sra_loss
+# from models_sra import ReT_SRA_models, EMAManager, compute_sra_loss
 from train_autoencoder import pert2mol_autoencoder
 from utils import (
     AE_SMILES_encoder, regexTokenizer, get_hash,
@@ -53,6 +53,9 @@ CHECKPOINT_DIR = None
 CURRENT_STEP = 0
 EXPERIMENT_DIR = None
 AUTO_REQUEUE = False
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 def cleanup():
@@ -78,8 +81,6 @@ def create_logger(logging_dir):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
-
-
 
 
 def create_dirs(args):
@@ -180,7 +181,7 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         x_batch_shape = (batch_size * 2,) + shape[1:]
     else:
         # No guidance
-        return flow.sample_dopri5(model, shape, num_steps=20,atol=1e-5, rtol=1e-3,model_kwargs=your_conditioning)
+        return flow.p_sample_loop(model, shape, device=device, progress=False, model_kwargs={})
     
     # Sample with batched conditioning
     def cfg_model_fn(x, t, **kwargs):
@@ -267,60 +268,11 @@ def run_validation(model, ema, test_loader, flow, ae_model, image_encoder, rna_e
                             return output[0]  # Return only the main output, ignore SRA representation
                         return output
                         
-                    loss_dict = flow.training_losses(ema_model_wrapper, x, model_kwargs=model_kwargs)
+                    loss_dict = flow.training_losses(ema_model_wrapper, x, t=torch.randint(0, flow.num_timesteps, (x.shape[0],), device=device), model_kwargs=model_kwargs)
                     flow_loss = loss_dict["loss"].mean()
                     
                     # Validation SRA loss
                     sra_loss = torch.tensor(0.0, device=device)
-                    if args.use_sra and sra_teacher_manager is not None:
-                        try:
-                            # Sample a timestep for SRA computation
-                            current_t = torch.randint(0, flow.num_timesteps, (x.shape[0],), device=device)
-                            
-                            # Get student representation from current model
-                            student_model = model.module if use_ddp else model
-                            student_output = student_model.forward(
-                                x, current_t, y=y.type(torch.float32), pad_mask=pad_mask.bool()
-                            )
-                            
-                            # Handle tuple return from SRA model
-                            if isinstance(student_output, tuple):
-                                _, student_repr = student_output
-                            else:
-                                student_repr = None
-                            
-                            # Get teacher representation from SRA teacher
-                            if student_repr is not None:
-                                sra_teacher = sra_teacher_manager.get_teacher()
-                                sra_teacher.eval()
-                                
-                                teacher_output = sra_teacher.forward(
-                                    x, current_t, y=y.type(torch.float32), pad_mask=pad_mask.bool(),
-                                    teacher_mode=True, teacher_timestep_offset=args.sra_timestep_offset_max // 2
-                                )
-                                
-                                # Handle tuple return from teacher
-                                if isinstance(teacher_output, tuple):
-                                    _, teacher_repr = teacher_output
-                                else:
-                                    teacher_repr = None
-                                
-                                # Compute SRA loss if both representations are available
-                                if teacher_repr is not None:
-                                    # Get projection head from student model
-                                    if hasattr(student_model, 'sra_projection_head'):
-                                        projection_head = student_model.sra_projection_head
-                                    else:
-                                        projection_head = student_model.module.sra_projection_head
-                                    
-                                    sra_loss = compute_sra_loss(
-                                        student_repr, teacher_repr, projection_head, 
-                                        distance_type=args.sra_distance_type
-                                    )
-                        except Exception as e:
-                            if not use_ddp or rank == 0:
-                                logger.warning(f"SRA validation failed for batch {batch_idx}: {e}")
-                            sra_loss = torch.tensor(0.0, device=device)
                     
                     # Accumulate losses
                     total_flow_loss += flow_loss.item() * x.shape[0]
@@ -380,7 +332,16 @@ def main(args):
             seed = args.global_seed * dist.get_world_size() + rank
             torch.manual_seed(seed)
             torch.cuda.set_device(device)
-            
+                    
+            # Setup experiment folder (only on rank 0)
+            if rank == 0:
+                experiment_dir, checkpoint_dir = create_dirs(args)
+                logger = create_logger(experiment_dir)
+                logger.info(f"Experiment directory created at {experiment_dir}")
+            else:
+                logger = create_logger(None)
+                experiment_dir = checkpoint_dir = None
+
             # Check CUDA compatibility (only print from rank 0)
             if rank == 0:
                 print(f"create_data_loader: {create_data_loader}")
@@ -396,15 +357,6 @@ def main(args):
                     raise e
             
             print(f"Starting distributed training: rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-            
-            # Setup experiment folder (only on rank 0)
-            if rank == 0:
-                experiment_dir, checkpoint_dir = create_dirs(args)
-                logger = create_logger(experiment_dir)
-                logger.info(f"Experiment directory created at {experiment_dir}")
-            else:
-                logger = create_logger(None)
-                experiment_dir = checkpoint_dir = None
                 
             use_ddp = True
             batch_size = args.batch_size
@@ -470,15 +422,12 @@ def main(args):
         cross_attn = 192
         conditioning_dim = 192
 
-        model = ReT_SRA_models[args.model](
+        model = ReT_models[args.model](
             input_size=latent_size,
             in_channels=in_channels,
             cross_attn=cross_attn,
             condition_dim=conditioning_dim,
-            use_sra=args.use_sra,
-            sra_layer_student=args.sra_layer_student,
-            sra_layer_teacher=args.sra_layer_teacher,
-            sra_projection_dim=args.sra_projection_dim
+            learn_sigma=False
         )
 
         if args.ckpt:
@@ -499,11 +448,7 @@ def main(args):
 
         # Initialize SRA teacher manager AFTER DDP wrapping
         sra_teacher_manager = None
-        if args.use_sra:
-            sra_teacher_manager = EMAManager(model.module if use_ddp else model, ema_decay=args.sra_ema_decay)
-            if not use_ddp or rank == 0:
-                logger.info(f"SRA enabled: student_layer={args.sra_layer_student}, teacher_layer={args.sra_layer_teacher}, lambda={args.sra_lambda}")
-            
+
         # Create diffusion instance
         betas = get_named_beta_schedule("linear", num_diffusion_timesteps=1000)
         flow = GaussianDiffusion(
@@ -774,58 +719,23 @@ def main(args):
 
                 student_model = model.module if use_ddp else model
 
-                # Sample consistent timestep for both student and teacher
-                current_t = flow.sample_time(x.shape[0], device)
-                current_noise = torch.randn_like(x)
-
-                # Use diffusion training losses
+                # Sample random timesteps for diffusion training
                 current_t = torch.randint(0, flow.num_timesteps, (x.shape[0],), device=device)
 
-                # Forward pass for student (captures both output and SRA representation)
-                student_output, student_repr = student_model.forward(
-                    x_t, (current_t * (flow.num_timesteps - 1)).long(), 
-                    y=y.type(torch.float32), pad_mask=pad_mask.bool()
-                )
+                # Create model kwargs for conditioning
+                model_kwargs = dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
 
-                # Handle learn_sigma case
-                if student_output.shape[1] == 2 * x.shape[1]:
-                    predicted_velocity, _ = torch.split(student_output, x.shape[1], dim=1)
-                else:
-                    predicted_velocity = student_output
-
-                # Flow loss using diffusion
+                # Use diffusion training losses - this handles the forward pass internally
                 loss_dict = flow.training_losses(
-                    lambda x_input, t_input, **kwargs: student_model.forward(x_input, t_input, **kwargs)[0],
-                    x, t=current_t, model_kwargs=dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
+                    student_model, x, t=current_t, model_kwargs=model_kwargs
                 )
                 flow_loss = loss_dict["loss"].mean()
 
                 # SRA loss computation using same timestep
                 sra_loss = torch.tensor(0.0, device=device)
-                if args.use_sra and sra_teacher_manager is not None and student_repr is not None:
-                    # Sample timestep offset for teacher (lower noise)
-                    teacher_timestep_offset = torch.randint(1, args.sra_timestep_offset_max + 1, (1,)).item()
-                    
-                    # Get teacher representation (with lower noise)
-                    teacher_model = sra_teacher_manager.get_teacher()
-                    teacher_model.eval()
-                    with torch.no_grad():
-                        _, teacher_repr = teacher_model.forward(
-                            x_t, (current_t * (flow.num_timesteps - 1)).long(),
-                            y=y.type(torch.float32), pad_mask=pad_mask.bool(),
-                            teacher_mode=True, teacher_timestep_offset=teacher_timestep_offset
-                        )
-                    
-                    # Compute SRA alignment loss
-                    if teacher_repr is not None:
-                        projection_head = student_model.sra_projection_head if hasattr(student_model, 'sra_projection_head') else student_model.module.sra_projection_head
-                        sra_loss = compute_sra_loss(
-                            student_repr, teacher_repr, projection_head,
-                            distance_type=args.sra_distance_type
-                        )
-
+                
                 # Total loss
-                total_loss = flow_loss + args.sra_lambda * sra_loss
+                total_loss = flow_loss
                 
                 opt.zero_grad()
                 total_loss.backward()
@@ -836,18 +746,11 @@ def main(args):
                     update_ema(ema, model.module)
                 else:
                     update_ema(ema, model)
-                    
-                # Update SRA teacher
-                if args.use_sra and sra_teacher_manager is not None:
-                    if use_ddp:
-                        sra_teacher_manager.update_teacher(model.module)
-                    else:
-                        sra_teacher_manager.update_teacher(model)
 
                 # Logging
                 running_loss += total_loss.item()
                 running_flow_loss += flow_loss.item()
-                running_sra_loss += sra_loss.item()
+                running_sra_loss += 0.0
                 log_steps += 1
                 train_steps += 1
                 
@@ -900,8 +803,6 @@ def main(args):
                                 "args": args,
                                 "train_steps": train_steps
                             }
-                            if args.use_sra and sra_teacher_manager is not None:
-                                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
                         else:
                             checkpoint = {
                                 "model": model.state_dict(),
@@ -912,8 +813,6 @@ def main(args):
                                 "args": args,
                                 "train_steps": train_steps
                             }
-                            if args.use_sra and sra_teacher_manager is not None:
-                                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
                         
                         # Add early stopping state
                         if early_stopping is not None:
@@ -980,8 +879,6 @@ def main(args):
                                         "early_stopping": early_stopping.state_dict(),
                                         "early_stopped": True
                                     }
-                                    if args.use_sra and sra_teacher_manager is not None:
-                                        final_checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
                                 else:
                                     final_checkpoint = {
                                         "model": model.state_dict(),
@@ -994,8 +891,6 @@ def main(args):
                                         "early_stopping": early_stopping.state_dict(),
                                         "early_stopped": True
                                     }
-                                    if args.use_sra and sra_teacher_manager is not None:
-                                        final_checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
                                 
                                 final_path = f"{checkpoint_dir}/final_early_stopped_{train_steps:07d}.pt"
                                 torch.save(final_checkpoint, final_path)
@@ -1046,6 +941,9 @@ def main(args):
                 logger.info("Training stopped early or interrupted. Cleaning up...")
     
     except Exception as e:
+        import traceback
+        logger.error(f"RANK {rank if 'rank' in locals() else 'UNKNOWN'}: Training failed with exception: {e}")
+        logger.error(f"RANK {rank if 'rank' in locals() else 'UNKNOWN'}: {traceback.format_exc()}")
         if not use_ddp or rank == 0:
             logger.error(f"Training failed with exception: {e}")
         raise e
@@ -1088,7 +986,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--model", type=str, choices=list(ReT_SRA_models.keys()), default="pert2molSRA")
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), default="pert2mol")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for data loading replicability")
@@ -1132,7 +1030,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug-mode", action='store_true', default=False)
     parser.add_argument("--debug-samples", type=int, default=2000, help="When in debug mode, use this many samples")
 
-    parser.add_argument("--use-sra", action="store_true", default=True, help="Enable Self-Representation Alignment")
+    parser.add_argument("--use-sra", action="store_true", default=False, help="Enable Self-Representation Alignment")
     parser.add_argument("--disable-sra", action="store_false", dest="use_sra", help="Disable Self-Representation Alignment")
     parser.add_argument("--sra-lambda", type=float, default=0.1, help="Weight for SRA loss")
     parser.add_argument("--sra-layer-student", type=int, default=4, help="Student layer for SRA extraction")

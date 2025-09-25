@@ -20,6 +20,62 @@ from .utils import validate_dosage_integration
 logger = logging.getLogger(__name__)
 
 
+def load_metadata(gene_count_matrix: pd.DataFrame=None, 
+                  gene_count_matrix_path: str=None):
+    # Load your original metadata
+    gdpx1x2_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/processed_data/GDPx1x2_metadata.csv")
+    gdpx3_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/GDPx3/metadata_updated.csv")
+    if gene_count_matrix is None:
+        gene_count_matrix = pd.read_parquet(gene_count_matrix_path)
+    
+    # Find shared conditions
+    shared_drugs = list(set(gdpx3_metadata['compound'].unique()).intersection(
+        gdpx1x2_metadata['compound'].unique()
+    ))
+    shared_drugs = [drug for drug in shared_drugs if drug != 'DMSO']
+    logger.info(f"Found {len(shared_drugs)} shared drugs (excluding DMSO)")
+
+    shared_cell_lines = list(set(gdpx3_metadata['cell_line'].unique()).intersection(
+        gdpx1x2_metadata['cell_line'].unique()
+    ))
+    logger.info(f"Found {len(shared_cell_lines)} shared cell lines: {shared_cell_lines}")
+    
+    # Create your control metadata (keep this as is - it's fine to share controls)
+    metadata_control = []
+    
+    # A549 control (special handling for dosage mismatch)
+    metadata_control.append(pd.merge(
+        gdpx3_metadata[(gdpx3_metadata['compound'] == 'DMSO') & (gdpx3_metadata['cell_line'] == 'A549')],
+        gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') & (gdpx1x2_metadata['cell_line'] == 'A549')],
+        left_on=['compound', 'cell_line', 'compound_concentration_in_uM', 'timepoint'],
+        right_on=['compound', 'cell_line', 'compound_concentration_in_uM', 'timepoint'],
+        suffixes=(':hist', ':rna'),
+    ))
+    
+    # Other cell lines control (exact matching)
+    metadata_control.append(pd.merge(
+        gdpx3_metadata[(gdpx3_metadata['compound'] == 'DMSO') & (gdpx3_metadata['cell_line'] != 'A549')],
+        gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') & (gdpx1x2_metadata['cell_line'] != 'A549')],
+        left_on=['compound', 'cell_line', 'timepoint'],
+        right_on=['compound', 'cell_line', 'timepoint'],
+        suffixes=(':hist', ':rna'),
+    ))
+        
+    metadata_control = pd.concat(metadata_control, ignore_index=True).drop_duplicates()
+    logger.info(f"Control samples: {len(metadata_control)}")
+
+    metadata_control = gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') &\
+         (gdpx1x2_metadata['sample_id'].isin(metadata_control['sample_id'].tolist()))]
+    logger.info(f"Control samples after filtering to GDPx1x2: {len(metadata_control)}")
+
+    # Fix data types
+    for col in metadata_control.columns:
+        if col.endswith('id'):
+            metadata_control[col] = metadata_control[col].astype(str)
+
+    return gdpx1x2_metadata, gdpx3_metadata, metadata_control, shared_drugs, shared_cell_lines, gene_count_matrix
+
+
 # Create combinations within each split
 def create_modality_combinations(rna_df, imaging_df, shared_cell_lines, suffix="train", compound_name_label='compound'):
     """Create paired combinations within a split"""
@@ -101,7 +157,7 @@ def create_modality_combinations(rna_df, imaging_df, shared_cell_lines, suffix="
     if combinations:
         combined_df = pd.DataFrame(combinations)
         logger.info(f"Created {len(combined_df)} {suffix} combinations")
-        logger.info(f"combined_df.head():\n{combined_df.head()}")
+        logger.debug(f"combined_df.head():\n{combined_df.head()}")
         return combined_df
     else:
         logger.warning(f"No {suffix} combinations could be created")
@@ -189,8 +245,8 @@ def create_gdp_dataloaders(
     # Load your original metadata
     gdpx1x2_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/processed_data/GDPx1x2_metadata.csv")
     gdpx3_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/GDPx3/metadata_updated.csv")
-    if gene_count_matrix is None:
-        gene_count_matrix = pd.read_parquet(GENE_COUNT_MATRIX_PATH)
+    if gene_count_matrix is None and gene_count_matrix_path is not None:
+        gene_count_matrix = pd.read_parquet(gene_count_matrix_path)
     
     # Find shared conditions
     shared_drugs = list(set(gdpx3_metadata['compound'].unique()).intersection(
@@ -268,68 +324,13 @@ def create_gdp_dataloaders(
         return train_loader, test_loader
 
 
-def load_metadata(gene_count_matrix=None):
-    # Load your original metadata
-    gdpx1x2_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/processed_data/GDPx1x2_metadata.csv")
-    gdpx3_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/GDPx3/metadata_updated.csv")
-    if gene_count_matrix is None:
-        gene_count_matrix = pd.read_parquet(GENE_COUNT_MATRIX_PATH)
-    
-    # Find shared conditions
-    shared_drugs = list(set(gdpx3_metadata['compound'].unique()).intersection(
-        gdpx1x2_metadata['compound'].unique()
-    ))
-    shared_drugs = [drug for drug in shared_drugs if drug != 'DMSO']
-    logger.info(f"Found {len(shared_drugs)} shared drugs (excluding DMSO)")
-
-    shared_cell_lines = list(set(gdpx3_metadata['cell_line'].unique()).intersection(
-        gdpx1x2_metadata['cell_line'].unique()
-    ))
-    logger.info(f"Found {len(shared_cell_lines)} shared cell lines: {shared_cell_lines}")
-    
-    # Create your control metadata (keep this as is - it's fine to share controls)
-    metadata_control = []
-    
-    # A549 control (special handling for dosage mismatch)
-    metadata_control.append(pd.merge(
-        gdpx3_metadata[(gdpx3_metadata['compound'] == 'DMSO') & (gdpx3_metadata['cell_line'] == 'A549')],
-        gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') & (gdpx1x2_metadata['cell_line'] == 'A549')],
-        left_on=['compound', 'cell_line', 'compound_concentration_in_uM', 'timepoint'],
-        right_on=['compound', 'cell_line', 'compound_concentration_in_uM', 'timepoint'],
-        suffixes=(':hist', ':rna'),
-    ))
-    
-    # Other cell lines control (exact matching)
-    metadata_control.append(pd.merge(
-        gdpx3_metadata[(gdpx3_metadata['compound'] == 'DMSO') & (gdpx3_metadata['cell_line'] != 'A549')],
-        gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') & (gdpx1x2_metadata['cell_line'] != 'A549')],
-        left_on=['compound', 'cell_line', 'timepoint'],
-        right_on=['compound', 'cell_line', 'timepoint'],
-        suffixes=(':hist', ':rna'),
-    ))
-        
-    metadata_control = pd.concat(metadata_control, ignore_index=True).drop_duplicates()
-    logger.info(f"Control samples: {len(metadata_control)}")
-
-    metadata_control = gdpx1x2_metadata[(gdpx1x2_metadata['compound'] == 'DMSO') &\
-         (gdpx1x2_metadata['sample_id'].isin(metadata_control['sample_id'].tolist()))]
-    logger.info(f"Control samples after filtering to GDPx1x2: {len(metadata_control)}")
-
-    # Fix data types
-    for col in metadata_control.columns:
-        if col.endswith('id'):
-            metadata_control[col] = metadata_control[col].astype(str)
-
-    return gdpx1x2_metadata, gdpx3_metadata, metadata_control, shared_drugs, shared_cell_lines, gene_count_matrix
-
-
 def create_gdp_rna_dataloaders(
     metadata_control: pd.DataFrame=None,
     metadata_control_path: str=None,
     metadata_drug: pd.DataFrame=None,
     drug_data_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl",
     raw_drug_csv_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv",
-    image_json_path: str="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json",
+    image_json_path: str=None,
     gene_count_matrix: pd.DataFrame=None,
     gene_count_matrix_path: str="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet",
     compound_name_label='compound',
@@ -358,7 +359,13 @@ def create_gdp_rna_dataloaders(
     ):
     
     # Load your original metadata
-    gdpx1x2_metadata, gdpx3_metadata, metadata_control, shared_drugs, shared_cell_lines, gene_count_matrix = load_metadata(gene_count_matrix=gene_count_matrix)
+    gdpx1x2_metadata, \
+        gdpx3_metadata, \
+            metadata_control, \
+                shared_drugs, \
+                    shared_cell_lines, \
+                        gene_count_matrix = load_metadata(gene_count_matrix=gene_count_matrix, 
+                                                          gene_count_matrix_path=gene_count_matrix_path)
 
     # Create leak-free train/test dataloaders
     train_loader, test_loader = create_leak_free_dataloaders(
@@ -405,7 +412,7 @@ def create_gdp_image_dataloaders(
     raw_drug_csv_path: str="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv",
     image_json_path: str="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json",
     gene_count_matrix: pd.DataFrame=None,
-    gene_count_matrix_path: str="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet",
+    gene_count_matrix_path: str=None,
     compound_name_label='compound',
     batch_size: int = 4,
     shuffle: bool = True,
@@ -433,8 +440,6 @@ def create_gdp_image_dataloaders(
     # Load your original metadata
     gdpx1x2_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/processed_data/GDPx1x2_metadata.csv")
     gdpx3_metadata = pd.read_csv("/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/data/GDP_data/GDPx3/metadata_updated.csv")
-    if gene_count_matrix is None:
-        gene_count_matrix = pd.read_parquet(GENE_COUNT_MATRIX_PATH)
     
     # Find shared conditions
     shared_drugs = list(set(gdpx3_metadata['compound'].unique()).intersection(
@@ -490,8 +495,8 @@ def create_gdp_image_dataloaders(
         metadata_imaging=gdpx3_metadata[gdpx3_metadata['compound'] != 'DMSO'],
         shared_drugs=shared_drugs,
         shared_cell_lines=shared_cell_lines,
-        gene_count_matrix=gene_count_matrix,
-        image_json_path=None,
+        gene_count_matrix=None,
+        image_json_path=image_json_path,
         final_train_test_ratio = (1-test_size)/test_size,
         batch_size=batch_size,
         shuffle=shuffle,

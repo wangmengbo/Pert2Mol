@@ -18,6 +18,8 @@ import hashlib
 import os
 import signal
 from glob import glob
+import random
+import argparse
 warnings.filterwarnings('ignore')
 RDLogger.DisableLog('rdApp.*')
 
@@ -478,9 +480,10 @@ def setup_signal_handlers(checkpoint_dir, experiment_dir, auto_requeue=False):
     AUTO_REQUEUE = auto_requeue
     
     def signal_handler(signum, frame):
-        global GRACEFUL_SHUTDOWN
+        # Import and modify the global variable in the main module
+        import train_pert2mol
         print(f"\n[SIGNAL] Received signal {signum}. Initiating graceful shutdown...")
-        GRACEFUL_SHUTDOWN = True
+        train_pert2mol.GRACEFUL_SHUTDOWN = True
         
         # Try to requeue the job if running under SLURM and auto_requeue is enabled
         if AUTO_REQUEUE:
@@ -517,32 +520,28 @@ def save_emergency_checkpoint(model, image_encoder, rna_encoder, ema, opt, args,
     try:
         print(f"[EMERGENCY] Saving checkpoint at step {train_steps}")
         
-        if use_ddp:
-            checkpoint = {
-                "model": model.module.state_dict(),
-                "image_encoder": image_encoder.module.state_dict(),
-                "rna_encoder": rna_encoder.module.state_dict(),
-                "ema": ema.state_dict(),
-                "opt": opt.state_dict(),
-                "args": args,
-                "train_steps": train_steps,
-                "emergency_save": True
-            }
-            if args.use_sra and sra_teacher_manager is not None:
-                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
-        else:
-            checkpoint = {
-                "model": model.state_dict(),
-                "image_encoder": image_encoder.state_dict(),
-                "rna_encoder": rna_encoder.state_dict(),
-                "ema": ema.state_dict(),
-                "opt": opt.state_dict(),
-                "args": args,
-                "train_steps": train_steps,
-                "emergency_save": True
-            }
-            if args.use_sra and sra_teacher_manager is not None:
-                checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
+        checkpoint = {
+            "model": model.module.state_dict() if use_ddp else model.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args,
+            "train_steps": train_steps,
+            "emergency_save": True
+        }
+        
+        if hasattr(args, 'scheduler') and args.scheduler != "none":
+            # You'll need to pass the scheduler to this function
+            # checkpoint["scheduler"] = scheduler.state_dict()
+            pass  # For now, skip scheduler in emergency saves
+
+        # Only save encoder states if they exist
+        if image_encoder is not None:
+            checkpoint["image_encoder"] = image_encoder.module.state_dict() if use_ddp else image_encoder.state_dict()
+        if rna_encoder is not None:
+            checkpoint["rna_encoder"] = rna_encoder.module.state_dict() if use_ddp else rna_encoder.state_dict()
+            
+        if args.use_sra and sra_teacher_manager is not None:
+            checkpoint["sra_teacher"] = sra_teacher_manager.get_teacher().state_dict()
         
         emergency_path = f"{CHECKPOINT_DIR}/emergency_{train_steps:07d}.pt"
         torch.save(checkpoint, emergency_path)
@@ -599,7 +598,7 @@ def find_latest_checkpoint(checkpoint_dir):
 
 
 def load_checkpoint_and_resume(checkpoint_path, model, image_encoder, rna_encoder, ema, opt, 
-                              sra_teacher_manager, use_ddp, rank, logger):
+                              sra_teacher_manager, use_ddp, rank, logger, scheduler=None):
     """Load checkpoint and return resume step"""
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         return 0
@@ -613,12 +612,17 @@ def load_checkpoint_and_resume(checkpoint_path, model, image_encoder, rna_encode
         # Load model states
         if use_ddp:
             model.module.load_state_dict(checkpoint["model"])
-            image_encoder.module.load_state_dict(checkpoint["image_encoder"])
-            rna_encoder.module.load_state_dict(checkpoint["rna_encoder"])
+            # Only load encoder states if they exist in both checkpoint and current setup
+            if image_encoder is not None and "image_encoder" in checkpoint:
+                image_encoder.module.load_state_dict(checkpoint["image_encoder"])
+            if rna_encoder is not None and "rna_encoder" in checkpoint:
+                rna_encoder.module.load_state_dict(checkpoint["rna_encoder"])
         else:
             model.load_state_dict(checkpoint["model"])
-            image_encoder.load_state_dict(checkpoint["image_encoder"])
-            rna_encoder.load_state_dict(checkpoint["rna_encoder"])
+            if image_encoder is not None and "image_encoder" in checkpoint:
+                image_encoder.load_state_dict(checkpoint["image_encoder"])
+            if rna_encoder is not None and "rna_encoder" in checkpoint:
+                rna_encoder.load_state_dict(checkpoint["rna_encoder"])
         
         ema.load_state_dict(checkpoint["ema"])
         opt.load_state_dict(checkpoint["opt"])
@@ -634,14 +638,73 @@ def load_checkpoint_and_resume(checkpoint_path, model, image_encoder, rna_encode
             save_type = "emergency" if emergency_save else "regular"
             logger.info(f"[RESUME] Loaded {save_type} checkpoint, resuming from step {resume_step}")
         
+        if scheduler is not None and "scheduler" in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+                if not use_ddp or rank == 0:
+                    logger.info(f"[RESUME] Loaded scheduler state")
+            except Exception as e:
+                if not use_ddp or rank == 0:
+                    logger.warning(f"[RESUME] Failed to load scheduler state: {e}")
+        
         return resume_step
         
     except Exception as e:
         if not use_ddp or rank == 0:
             logger.error(f"[RESUME] Failed to load checkpoint {checkpoint_path}: {e}")
         return 0
+    
 
-
+def load_checkpoint_and_resume_specified(checkpoint_path, model, image_encoder, rna_encoder, ema, opt, 
+                                       sra_teacher_manager, use_ddp, rank, logger, scheduler=None):
+    """Load checkpoint from specified path and return resume step"""
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return 0
+    
+    try:
+        if not use_ddp or rank == 0:
+            logger.info(f"[RESUME] Loading checkpoint from {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Load model states
+        if use_ddp:
+            model.module.load_state_dict(checkpoint["model"])
+            if image_encoder is not None and "image_encoder" in checkpoint:
+                image_encoder.module.load_state_dict(checkpoint["image_encoder"])
+            if rna_encoder is not None and "rna_encoder" in checkpoint:
+                rna_encoder.module.load_state_dict(checkpoint["rna_encoder"])
+        else:
+            model.load_state_dict(checkpoint["model"])
+            if image_encoder is not None and "image_encoder" in checkpoint:
+                image_encoder.load_state_dict(checkpoint["image_encoder"])
+            if rna_encoder is not None and "rna_encoder" in checkpoint:
+                rna_encoder.load_state_dict(checkpoint["rna_encoder"])
+        
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        
+        # Load SRA teacher if available
+        if "sra_teacher" in checkpoint and sra_teacher_manager is not None:
+            sra_teacher_manager.get_teacher().load_state_dict(checkpoint["sra_teacher"])
+        
+        # Load scheduler if available
+        if scheduler is not None and "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        
+        resume_step = checkpoint.get("train_steps", 0)
+        
+        if not use_ddp or rank == 0:
+            logger.info(f"[RESUME] Successfully resumed from step {resume_step}")
+        
+        return resume_step
+        
+    except Exception as e:
+        if not use_ddp or rank == 0:
+            logger.error(f"[RESUME] Failed to load checkpoint {checkpoint_path}: {e}")
+        return 0
+    
+    
 class EarlyStopping:
     """Early stopping utility to stop training when validation loss stops improving."""
     
@@ -692,13 +755,14 @@ class EarlyStopping:
             if self.verbose:
                 print(f"Early stopping: Initial score set to {current_score:.6f}")
         elif self.is_better(current_score, self.best_score):
-            # Improvement found
+            # Improvement found - FIXED: Save old score before updating
+            old_best = self.best_score
             self.best_score = current_score
             self.wait = 0
             if model is not None and self.restore_best_weights:
                 self.best_weights = self._get_model_state(model)
             if self.verbose:
-                print(f"Early stopping: New best score {current_score:.6f} (improvement of {abs(current_score - self.best_score):.6f})")
+                print(f"Early stopping: New best score {current_score:.6f} (improvement of {abs(current_score - old_best):.6f})")
         else:
             # No improvement
             self.wait += 1
@@ -821,3 +885,23 @@ def collect_all_drugs_from_csv(raw_drug_csv_path, compound_name_label='compound'
             'smiles_to_compound': {}
         }
 
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def restricted_float(x):
+    try:
+        x = float(x)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{x!r} not a floating-point literal")
+    
+    if x <= 0.0 or x > 1.0:
+        raise argparse.ArgumentTypeError(f"{x!r} not in range (0.0, 1.0]")
+    return x

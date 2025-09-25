@@ -69,19 +69,14 @@ def create_tahoe_dataloaders(
     if gene_count_matrix is None:
         gene_count_matrix = pd.read_parquet(gene_count_matrix_path).T
 
-    metadata_control = pd.read_csv(METADATA_CONTROL_PATH)
-    metadata_drug = pd.read_csv(METADATA_DRUG_PATH)
-    gene_count_matrix = pd.read_parquet(GENE_COUNT_MATRIX_PATH).T
-
     # Create leak-free train/test dataloaders
     train_loader, test_loader = create_leak_free_dataloaders(
-        metadata_control,
-        DRUG_DATA_PATH,
-        RAW_DRUG_CSV_PATH,
+        metadata_control=metadata_control,
+        drug_data_path=drug_data_path,
+        raw_drug_csv_path=raw_drug_csv_path,
         metadata_rna=metadata_drug,
         metadata_imaging=None,
         image_json_path=None,
-        # test_size=test_size,
         final_train_test_ratio = (1-test_size)/test_size,
         batch_size=batch_size,
         shuffle=shuffle,

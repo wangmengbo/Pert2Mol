@@ -34,14 +34,13 @@ from dataloaders.dataset_lincs_rna import create_lincs_rna_dataloaders
 from dataloaders.dataset_cpgjump import create_cpgjump_dataloaders
 from dataloaders.dataset_tahoe import create_tahoe_dataloaders
 from dataloaders.dataloader import create_leak_free_dataloaders
-from models import ReT_models
-from models_sra import ReT_SRA_models
+from models import ReT_models  # Use standard models for baseline
 from train_autoencoder import pert2mol_autoencoder
 from utils import AE_SMILES_decoder, regexTokenizer
 from encoders import ImageEncoder, RNAEncoder, PairedRNAEncoder
 from encoders import dual_rna_image_encoder_separate as dual_rna_image_encoder
-from diffusion.rectified_flow import create_rectified_flow
-from utils import (collect_all_drugs_from_csv, AE_SMILES_encoder, set_seed, restricted_float)
+from diffusion.gaussian_diffusion import GaussianDiffusion, get_named_beta_schedule, ModelMeanType, ModelVarType, LossType  # Use Gaussian diffusion for baseline
+from utils import (collect_all_drugs_from_csv, AE_SMILES_encoder, set_seed,)
 from evaluation_utils import (create_three_section_summary, clear_training_features_cache,  
     get_evaluation_cache_key, load_evaluation_results_cache, save_evaluation_results_cache, clear_evaluation_results_cache,
     collect_training_data_with_biological_features_cached, collect_training_data_with_biological_features_original,
@@ -54,53 +53,39 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def run_pure_generation(model, flow, ae_model, y_features, pad_mask, device, args):
-    """Pure generation: generate new molecules without retrieval - MODIFIED to save embeddings"""
+def run_pure_generation_baseline(model, flow, ae_model, y_features, pad_mask, device, args):
+    """Pure generation for baseline method using Gaussian diffusion"""
     
     batch_size = y_features.shape[0]
     shape = (batch_size, 64, 127, 1)
     
     all_generated_smiles = []
-    all_generated_embeddings = []  # NEW: Store embeddings
     
     # Generate multiple samples per condition
     for sample_idx in range(args.num_samples_per_condition):
         with torch.no_grad():
-            x = torch.randn(*shape, device=device)
-            dt = 1.0 / args.generation_steps
+            # Use Gaussian diffusion p_sample_loop for baseline
+            model_kwargs = dict(y=y_features, pad_mask=pad_mask)
             
-            for i in range(args.generation_steps):
-                t = torch.full((batch_size,), i * dt, device=device)
-                t_discrete = (t * 999).long()
-                
-                velocity = model(x, t_discrete, y=y_features, pad_mask=pad_mask)
-                if isinstance(velocity, tuple):
-                    velocity = velocity[0]
-                
-                if velocity.shape[1] == 2 * x.shape[1]:
-                    velocity, _ = torch.split(velocity, x.shape[1], dim=1)
-                
-                x = x + dt * velocity
-            
-            # NEW: Save embeddings before decoding
-            generated_embeddings = x.squeeze(-1).permute((0, 2, 1))
-            all_generated_embeddings.append(generated_embeddings.cpu().numpy())
+            # Generate using the baseline's Gaussian diffusion approach
+            x = flow.p_sample_loop(
+                model, 
+                shape, 
+                device=device,
+                progress=False,
+                model_kwargs=model_kwargs
+            )
             
             # Decode to SMILES
-            batch_generated = AE_SMILES_decoder(generated_embeddings, ae_model, stochastic=False, k=1)
+            x = x.squeeze(-1).permute((0, 2, 1))
+            batch_generated = AE_SMILES_decoder(x, ae_model, stochastic=False, k=1)
             all_generated_smiles.extend(batch_generated)
     
-    # Concatenate all embeddings
-    if all_generated_embeddings:
-        all_generated_embeddings = np.vstack(all_generated_embeddings)
-    else:
-        all_generated_embeddings = None
-    
-    return all_generated_smiles, all_generated_embeddings  # Return both SMILES and embeddings
+    return all_generated_smiles
 
 
-def run_conventional_retrieval(test_batch, training_data, y_features, args):
-    """Conventional retrieval: biological similarity-based matching to find drugs - OPTIMIZED VERSION"""
+def run_conventional_retrieval_baseline(test_batch, training_data, y_features, args):
+    """Conventional retrieval for baseline - same as main method"""
     
     retrieved_results = []
     target_smiles = test_batch['target_smiles']
@@ -192,9 +177,9 @@ def run_conventional_retrieval(test_batch, training_data, y_features, args):
     return retrieved_results
 
 
-def run_retrieval_by_generation(test_batch, training_data, model, flow, ae_model, 
-                                y_features, pad_mask, device, args):
-    """Retrieval by generation: use model to generate drug embeddings, then find similar drugs in dataset - OPTIMIZED VERSION"""
+def run_retrieval_by_generation_baseline(test_batch, training_data, model, flow, ae_model, 
+                                        y_features, pad_mask, device, args):
+    """Retrieval by generation for baseline method using Gaussian diffusion"""
     
     retrieved_results = []
     target_smiles = test_batch['target_smiles']
@@ -204,22 +189,18 @@ def run_retrieval_by_generation(test_batch, training_data, model, flow, ae_model
     # Step 1: Use trained model to generate drug embeddings from biological features
     with torch.no_grad():
         shape = (batch_size, 64, 127, 1)
-        x = torch.randn(*shape, device=device)
-        dt = 1.0 / args.generation_steps
         
-        # Run diffusion process to get drug latent representations
-        for i in range(args.generation_steps):
-            t = torch.full((batch_size,), i * dt, device=device)
-            t_discrete = (t * 999).long()
-            
-            velocity = model(x, t_discrete, y=y_features, pad_mask=pad_mask)
-            if isinstance(velocity, tuple):
-                velocity = velocity[0]
-            
-            if velocity.shape[1] == 2 * x.shape[1]:
-                velocity, _ = torch.split(velocity, x.shape[1], dim=1)
-            
-            x = x + dt * velocity
+        # Use Gaussian diffusion for baseline generation
+        model_kwargs = dict(y=y_features, pad_mask=pad_mask)
+        
+        # Generate using baseline's Gaussian diffusion approach
+        x = flow.p_sample_loop(
+            model, 
+            shape, 
+            device=device,
+            progress=False,
+            model_kwargs=model_kwargs
+        )
         
         # Generated drug latent representations
         generated_drug_latents = x.squeeze(-1).permute((0, 2, 1))
@@ -308,18 +289,13 @@ def run_retrieval_by_generation(test_batch, training_data, model, flow, ae_model
     return retrieved_results, generated_drug_latents.cpu().numpy(), dataset_latents.cpu().numpy()
 
 
-def run_three_mode_evaluation(test_batch, training_data, model, flow, ae_model, 
-                                       image_encoder, rna_encoder, y_features, pad_mask, device, args):
-    """Enhanced three-mode evaluation with comprehensive intermediate result saving"""
+def run_three_mode_evaluation_baseline(test_batch, training_data, model, flow, ae_model, 
+                                      image_encoder, rna_encoder, y_features, pad_mask, device, args):
+    """Enhanced three-mode evaluation for baseline with comprehensive intermediate result saving"""
     
     batch_size = len(test_batch['target_smiles'])
     results_by_mode = {'pure_generation': [], 'conventional_retrieval': [], 'retrieval_by_generation': []}
     
-    # Initialize embedding variables for BOTH modes
-    generated_embeddings = None
-    reference_embeddings = None
-    generated_embeddings_pure = None  # NEW: For pure generation mode
-   
     # Save additional data for comprehensive analysis
     intermediate_data = {
         'batch_biological_features': y_features.cpu().numpy() if y_features is not None else None,
@@ -332,7 +308,7 @@ def run_three_mode_evaluation(test_batch, training_data, model, flow, ae_model,
     
     # Mode 1: Pure Generation with enhanced data collection
     if args.run_generation:
-        generated_smiles_list, generated_embeddings_pure = run_pure_generation(model, flow, ae_model, y_features, pad_mask, device, args)
+        generated_smiles_list = run_pure_generation_baseline(model, flow, ae_model, y_features, pad_mask, device, args)
         
         # Save all generated samples, not just the best one
         samples_per_condition = args.num_samples_per_condition
@@ -387,13 +363,12 @@ def run_three_mode_evaluation(test_batch, training_data, model, flow, ae_model,
         intermediate_data['generation_data'] = {
             'all_generated_per_condition': all_generated_per_condition,
             'total_generated': len(generated_smiles_list),
-            'samples_per_condition': samples_per_condition,
-            'generated_embeddings_shape': generated_embeddings_pure.shape if generated_embeddings_pure is not None else None
+            'samples_per_condition': samples_per_condition
         }
     
     # Mode 2: Conventional Retrieval (unchanged)
     if args.run_conventional_retrieval:
-        retrieval_results = run_conventional_retrieval(test_batch, training_data, y_features, args)
+        retrieval_results = run_conventional_retrieval_baseline(test_batch, training_data, y_features, args)
         
         for i in range(batch_size):
             retrieval_result = retrieval_results[i] if i < len(retrieval_results) else {}
@@ -425,7 +400,7 @@ def run_three_mode_evaluation(test_batch, training_data, model, flow, ae_model,
     reference_embeddings = None
     
     if args.run_retrieval_by_generation:
-        retrieval_by_gen_results, generated_embeddings, reference_embeddings = run_retrieval_by_generation(
+        retrieval_by_gen_results, generated_embeddings, reference_embeddings = run_retrieval_by_generation_baseline(
             test_batch, training_data, model, flow, ae_model, y_features, pad_mask, device, args
         )
         
@@ -459,11 +434,11 @@ def run_three_mode_evaluation(test_batch, training_data, model, flow, ae_model,
             'reference_embeddings_shape': reference_embeddings.shape if reference_embeddings is not None else None,
         }
     
-    return results_by_mode, generated_embeddings, reference_embeddings, intermediate_data, generated_embeddings_pure
+    return results_by_mode, generated_embeddings, reference_embeddings, intermediate_data
 
 
-def detect_modalities(args, gene_count_matrix):
-    """Detect available modalities for evaluation"""
+def detect_modalities_baseline(args, gene_count_matrix):
+    """Detect available modalities for evaluation - same as main method"""
     has_rna = gene_count_matrix is not None and len(gene_count_matrix) > 0
     has_imaging = args.image_json_path is not None and os.path.exists(args.image_json_path)
     
@@ -480,10 +455,10 @@ def detect_modalities(args, gene_count_matrix):
     return has_rna, has_imaging
 
 
-def run_independent_evaluation(args):
-    """Enhanced evaluation with comprehensive intermediate result saving"""
+def run_independent_evaluation_baseline(args):
+    """Enhanced evaluation for baseline method with comprehensive intermediate result saving"""
     
-    logger.info("Setting up enhanced three-mode evaluation with comprehensive caching...")
+    logger.info("Setting up enhanced three-mode evaluation for BASELINE method with comprehensive caching...")
     
     # Set up device and seed
     set_seed(args.seed)
@@ -525,16 +500,12 @@ def run_independent_evaluation(args):
     else:
         gene_count_matrix = None
     
-    has_rna, has_imaging = detect_modalities(args, gene_count_matrix)
+    has_rna, has_imaging = detect_modalities_baseline(args, gene_count_matrix)
     logger.info(f"Using modalities - RNA: {has_rna}, Imaging: {has_imaging}")
 
     # Set up data loader function based on dataset type
     if args.dataset == "gdp":
         create_data_loader = create_gdp_dataloaders
-    elif args.dataset == "gdp_rna":
-        create_data_loader = create_gdp_rna_dataloaders
-    elif args.dataset == "gdp_image":
-        create_data_loader = create_gdp_image_dataloaders
     elif args.dataset == "lincs_rna":
         create_data_loader = create_lincs_rna_dataloaders
         if gene_count_matrix is not None:
@@ -575,7 +546,7 @@ def run_independent_evaluation(args):
         raw_drug_csv_path=args.raw_drug_csv_path,
         batch_size=args.batch_size,
         shuffle=True,
-        shuffle_test=False,
+        shuffle_test=True,
         compound_name_label=args.compound_name_label,
         exclude_cell_lines=args.exclude_cell_lines,
         exclude_drugs=args.exclude_drugs,
@@ -616,31 +587,24 @@ def run_independent_evaluation(args):
     model = image_encoder = rna_encoder = ae_model = flow = None
     
     if args.run_generation or args.run_retrieval_by_generation or args.run_conventional_retrieval:
-        logger.info("Loading models for evaluation...")
+        logger.info("Loading BASELINE models for evaluation...")
         
-        # Create ReT model (needed for generation and retrieval by generation)
+        # Create ReT model for baseline (using standard models, not SRA)
         if args.run_generation or args.run_retrieval_by_generation:
             latent_size = 127
             in_channels = 64
             cross_attn = 192
             condition_dim = 192
             
-            try:
-                model = ReT_SRA_models[args.model](
-                    input_size=latent_size,
-                    in_channels=in_channels,
-                    cross_attn=cross_attn,
-                    condition_dim=condition_dim
-                ).to(device)
-                logger.info(f"Using SRA model: {args.model}")
-            except KeyError:
-                model = ReT_models[args.model](
-                    input_size=latent_size,
-                    in_channels=in_channels,
-                    cross_attn=cross_attn,
-                    condition_dim=condition_dim
-                ).to(device)
-                logger.info(f"Using standard model: {args.model}")
+            # Use standard ReT model for baseline
+            model = ReT_models[args.model](
+                input_size=latent_size,
+                in_channels=in_channels,
+                cross_attn=cross_attn,
+                condition_dim=condition_dim,
+                learn_sigma=False
+            ).to(device)
+            logger.info(f"Using baseline model: {args.model}")
             
             # Load checkpoint
             checkpoint = torch.load(args.ckpt, map_location='cpu')
@@ -648,7 +612,7 @@ def run_independent_evaluation(args):
 
             model.load_state_dict(checkpoint['model'], strict=False)
             model.eval()
-            logger.info(f"Loaded ReT model from {args.ckpt}")
+            logger.info(f"Loaded baseline ReT model from {args.ckpt}")
         else:
             # For conventional retrieval only, we still need encoders
             checkpoint = torch.load(args.ckpt, map_location='cpu')
@@ -660,7 +624,7 @@ def run_independent_evaluation(args):
             image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
             image_encoder.load_state_dict(checkpoint['image_encoder'], strict=True)
             image_encoder.eval()
-            logger.info("Loaded ImageEncoder for evaluation")
+            logger.info("Loaded ImageEncoder for baseline evaluation")
         else:
             logger.info('Skipping ImageEncoder - no imaging data available')
 
@@ -685,7 +649,7 @@ def run_independent_evaluation(args):
             
             rna_encoder.load_state_dict(checkpoint['rna_encoder'], strict=True) 
             rna_encoder.eval()
-            logger.info("Loaded RNAEncoder for evaluation")
+            logger.info("Loaded RNAEncoder for baseline evaluation")
         else:
             logger.info('Skipping RNAEncoder - no RNA data available')
         
@@ -712,11 +676,18 @@ def run_independent_evaluation(args):
             ae_model = ae_model.to(device)
             ae_model.eval()
             
-            # Setup rectified flow for generation
+            # Setup Gaussian diffusion for baseline generation
             if args.run_generation:
-                flow = create_rectified_flow(num_timesteps=1000)
+                betas = get_named_beta_schedule("linear", num_diffusion_timesteps=1000)
+                flow = GaussianDiffusion(
+                    betas=betas,
+                    model_mean_type=ModelMeanType.EPSILON,  # Model predicts noise
+                    model_var_type=ModelVarType.FIXED_SMALL,
+                    loss_type=LossType.MSE
+                )
+                logger.info("Using Gaussian diffusion for baseline generation")
         
-        logger.info("Models loaded successfully")
+        logger.info("Baseline models loaded successfully")
     
     # Collect training data based on enabled modes
     training_data = {'smiles': [], 'compound_names': []}
@@ -775,12 +746,11 @@ def run_independent_evaluation(args):
     all_generated_embeddings = []
     all_sample_metadata = []
     reference_drug_embeddings = None
-    all_generated_embeddings_pure = []
-
+    
     eval_start_time = time.time()
     processed_samples = 0
     
-    logger.info(f"Starting enhanced three-mode evaluation on test data...")
+    logger.info(f"Starting enhanced three-mode evaluation on BASELINE test data...")
     logger.info(f"Modes enabled: Generation={args.run_generation}, Conventional Retrieval={args.run_conventional_retrieval}, Retrieval by Generation={args.run_retrieval_by_generation}")
     
     for batch_idx, batch in enumerate(tqdm(eval_loader, desc="Evaluating test data")):
@@ -805,9 +775,9 @@ def run_independent_evaluation(args):
                     batch['control_transcriptomics'], batch['treatment_transcriptomics'],
                     image_encoder, rna_encoder, device, has_rna, has_imaging
                 )
-
-        # Run enhanced multi-mode evaluation for this batch
-        batch_results, generated_embeddings, reference_embeddings, intermediate_data, generated_embeddings_pure = run_three_mode_evaluation(
+        
+        # Run enhanced multi-mode evaluation for this batch using baseline
+        batch_results, generated_embeddings, reference_embeddings, intermediate_data = run_three_mode_evaluation_baseline(
             batch, training_data, model, flow, ae_model, 
             image_encoder, rna_encoder, y_features, pad_mask, device, args
         )
@@ -823,9 +793,6 @@ def run_independent_evaluation(args):
         if args.run_retrieval_by_generation and generated_embeddings is not None:
             all_generated_embeddings.append(generated_embeddings)
         
-        if args.run_generation and generated_embeddings_pure is not None:
-            all_generated_embeddings_pure.append(generated_embeddings_pure)
-    
         # Accumulate results
         for mode, results in batch_results.items():
             all_results_by_mode[mode].extend(results)
@@ -851,7 +818,7 @@ def run_independent_evaluation(args):
         processed_samples += len(batch['target_smiles'])
     
     eval_time = time.time() - eval_start_time
-    logger.info(f"Evaluation completed in {eval_time:.1f}s")
+    logger.info(f"Baseline evaluation completed in {eval_time:.1f}s")
     logger.info(f"Processed {processed_samples} test samples")
     
     # Calculate mode-specific metrics
@@ -892,49 +859,11 @@ def run_independent_evaluation(args):
             reference_metadata.to_csv(reference_metadata_path, index=False)
             logger.info(f"Saved reference drug metadata: {reference_metadata_path} ({len(reference_metadata)} drugs)")
     
-    if args.run_generation:
-        # Concatenate all generated embeddings from pure generation
-        if all_generated_embeddings_pure:
-            all_generated_embeddings_pure_matrix = np.vstack(all_generated_embeddings_pure)
-            
-            # Save generated drug embeddings from pure generation (one row per generated sample)
-            pure_gen_embeddings_path = os.path.join(args.output_dir, f"{args.output_prefix}_pure_generation_embeddings.npy")
-            np.save(pure_gen_embeddings_path, all_generated_embeddings_pure_matrix)
-            logger.info(f"Saved pure generation drug embeddings: {pure_gen_embeddings_path} (shape: {all_generated_embeddings_pure_matrix.shape})")
-            
-            # Create metadata for pure generation samples
-            pure_gen_metadata = []
-            sample_idx = 0
-
-            for batch_idx in range(len(all_intermediate_data)):
-                batch_data = all_intermediate_data[batch_idx]
-                batch_metadata = batch_data.get('batch_metadata', {})
-                target_smiles_list = batch_metadata.get('target_smiles', [])
-                compound_names = batch_metadata.get('compound_names', [])
-                
-                for i, (target_smiles, compound_name) in enumerate(zip(target_smiles_list, compound_names)):
-                    # For each biological condition, we generated multiple samples
-                    for sample_idx_within_condition in range(args.num_samples_per_condition):
-                        pure_gen_metadata.append({
-                            'global_sample_idx': sample_idx,
-                            'batch_idx': batch_idx,
-                            'condition_idx_in_batch': i,
-                            'sample_idx_within_condition': sample_idx_within_condition,
-                            'target_smiles': target_smiles,
-                            'compound_name': compound_name,
-                        })
-                        sample_idx += 1
-            
-            # Save pure generation sample metadata
-            if pure_gen_metadata:
-                pure_gen_metadata_df = pd.DataFrame(pure_gen_metadata)
-                pure_gen_metadata_path = os.path.join(args.output_dir, f"{args.output_prefix}_pure_generation_metadata.csv")
-                pure_gen_metadata_df.to_csv(pure_gen_metadata_path, index=False)
-                logger.info(f"Saved pure generation metadata: {pure_gen_metadata_path} ({len(pure_gen_metadata_df)} samples)")
-
     # Create metadata
     metadata = {
-        'evaluation_mode': 'three_mode_comprehensive_enhanced',
+        'evaluation_mode': 'three_mode_comprehensive_enhanced_baseline',
+        'baseline_method': True,
+        'diffusion_type': 'gaussian',
         'modes_enabled': {
             'pure_generation': args.run_generation,
             'conventional_retrieval': args.run_conventional_retrieval,
@@ -959,8 +888,6 @@ def run_independent_evaluation(args):
             'reference_embeddings': f"{args.output_prefix}_reference_embeddings.npy" if args.run_retrieval_by_generation else None,
             'sample_metadata': f"{args.output_prefix}_sample_metadata.csv" if args.run_retrieval_by_generation else None,
             'reference_metadata': f"{args.output_prefix}_reference_metadata.csv" if args.run_retrieval_by_generation else None,
-            'pure_generation_embeddings': f"{args.output_prefix}_pure_generation_embeddings.npy" if args.run_generation else None,
-            'pure_generation_metadata': f"{args.output_prefix}_pure_generation_metadata.csv" if args.run_generation else None,
             'biological_features': f"{args.output_prefix}_batch_biological_features.npz",
             'generation_analysis': f"{args.output_prefix}_generation_analysis.json" if args.run_generation else None,
         }
@@ -999,7 +926,7 @@ def run_independent_evaluation(args):
     if not args.no_cache:
         try:
             save_evaluation_results_cache(cache_key, comprehensive_data, args.cache_dir)
-            logger.info(f"Comprehensive evaluation results cached with key: {cache_key}")
+            logger.info(f"Comprehensive baseline evaluation results cached with key: {cache_key}")
         except Exception as e:
             logger.warning(f"Failed to save evaluation cache: {e}")
     
@@ -1007,7 +934,7 @@ def run_independent_evaluation(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Three-mode comprehensive evaluation of drug generation models")
+    parser = argparse.ArgumentParser(description="Three-mode comprehensive evaluation of BASELINE drug generation models")
     
     # Three evaluation modes
     parser.add_argument("--run-generation", action="store_true", 
@@ -1033,18 +960,20 @@ def main():
                        help="Top-k drugs to retrieve for retrieval by generation evaluation")
     
     # Evaluation scope
-    parser.add_argument("--max-training-portion", type=restricted_float, default=None, 
-                        help="Maximum portion of training data to use for retrieval evaluation (0.0-1.0]")
+    parser.add_argument("--max-training-portion", type=float, default=None,
+                   help="Maximum portion of training data to use for retrieval evaluation (0.0-1.0)")
     parser.add_argument("--max-training-batches", type=int, default=None, 
-                        help="Maximum number of training batches to use for collecting training data")
+                    help="Maximum number of training batches to use for collecting training data")
+
     parser.add_argument("--max-test-samples", type=int, default=None, 
-                        help="Maximum number of test samples to evaluate (0 = no limit)")
-    parser.add_argument("--eval-portion", type=restricted_float, default=None, help="Portion of test data to evaluate (0.0-1.0]")
+                    help="Maximum number of test samples to evaluate (0 = no limit)")
+    parser.add_argument("--eval-portion", type=float, default=None,
+                       help="Portion of test data to evaluate (0.0-1.0)")
     parser.add_argument("--max-eval-batches", type=int, default=None,
                        help="Maximum number of batches to evaluate (0 = no limit)")
 
     # Model and checkpoint arguments
-    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()) + list(ReT_SRA_models.keys()), 
+    parser.add_argument("--model", type=str, choices=list(ReT_models.keys()), 
                        default="pert2mol", help="Model architecture")
     parser.add_argument("--ckpt", type=str, default=None,
                        help="Path to model checkpoint (required for generation/retrieval-by-generation)")
@@ -1053,7 +982,7 @@ def main():
                        help="Path to autoencoder checkpoint")
     
     # Dataset arguments
-    parser.add_argument("--dataset", type=str, choices=["gdp",  "gdp_rna", "gdp_image", "lincs_rna", "cpgjump", "tahoe", "other"], default="gdp")
+    parser.add_argument("--dataset", type=str, choices=["gdp", "lincs_rna", "cpgjump", "tahoe", "other"], default="gdp")
     parser.add_argument("--image-json-path", type=str, default=None)
     parser.add_argument("--drug-data-path", type=str, default=None)
     parser.add_argument("--raw-drug-csv-path", type=str, default=None)
@@ -1083,7 +1012,7 @@ def main():
     
     # Output arguments
     parser.add_argument("--output-prefix", type=str, default=None)
-    parser.add_argument("--output-dir", type=str, default="./evaluation_results")
+    parser.add_argument("--output-dir", type=str, default="./evaluation_results_baseline")
     parser.add_argument("--verbose", action="store_true")
     
     # Cache control arguments
@@ -1131,16 +1060,16 @@ def main():
     else:
         os.makedirs(args.cache_dir, exist_ok=True)
 
-    logger.info(f"Starting three-mode evaluation:")
+    logger.info(f"Starting BASELINE three-mode evaluation:")
     logger.info(f"  Pure Generation: {args.run_generation}")
     logger.info(f"  Conventional Retrieval: {args.run_conventional_retrieval}")
     logger.info(f"  Retrieval by Generation: {args.run_retrieval_by_generation}")
 
     if args.output_prefix == "evaluation":
         timestamp = time.strftime('%Y%m%d_%H%M%S')
-        args.output_prefix = f"{args.dataset}_{args.seed}_{timestamp}"
+        args.output_prefix = f"{args.dataset}_baseline_{args.seed}_{timestamp}"
 
-    logger.info(f"Starting evaluation with settings:")
+    logger.info(f"Starting BASELINE evaluation with settings:")
     logger.info(f"  Dataset: {args.dataset}")
     logger.info(f"  Eval portion: {args.eval_portion*100:.1f}%" if args.eval_portion is not None else "  Eval portion: all data")
     logger.info(f"  Max batches: {args.max_eval_batches}" if args.max_eval_batches is not None else "  Max batches: unlimited")
@@ -1149,8 +1078,8 @@ def main():
     logger.info(f"  Seed: {args.seed}")
     logger.info(f"  Output: {args.output_dir}")
     
-    # Run three-mode evaluation
-    comprehensive_data = run_independent_evaluation(args)
+    # Run three-mode evaluation for baseline
+    comprehensive_data = run_independent_evaluation_baseline(args)
     
     # Save comprehensive results
     timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -1170,7 +1099,7 @@ def main():
     mode_metrics = comprehensive_data['mode_metrics']
     
     logger.info(f"\n{'='*80}")
-    logger.info("THREE-MODE EVALUATION COMPLETE")
+    logger.info("BASELINE THREE-MODE EVALUATION COMPLETE")
     logger.info(f"{'='*80}")
     logger.info(f"Evaluation time: {metadata['evaluation_time']:.1f}s")
     

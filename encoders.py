@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional
 
+
 class ResidualBlock(nn.Module):
     """Residual block with normalization and dropout"""
     def __init__(self, in_dim, out_dim, dropout=0.1):
@@ -61,6 +62,7 @@ class GeneMultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, N, D)  # [B, N, D]
         
         return self.out_proj(out), attn_weights
+
 
 class RNAEncoder(nn.Module):
     """
@@ -249,6 +251,7 @@ class RNAEncoder(nn.Module):
             
             return attention_weights_all  # List of [B, num_heads, N, N] tensors
 
+
 class GeneConditionCrossAttention(nn.Module):
     """Cross-attention between control and treatment gene representations."""
     def __init__(self, embed_dim, num_heads, dropout=0.1):
@@ -289,6 +292,7 @@ class GeneConditionCrossAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, N, D)  # [B, N, D]
         
         return self.out_proj(out), attn_weights
+
 
 class PairedRNAEncoder(nn.Module):
     """
@@ -689,6 +693,7 @@ class PairedRNAEncoder(nn.Module):
             
         return results
 
+
 class ResBlock(nn.Module):
     """ResNet-style residual block for image processing"""
     def __init__(self, in_channels, out_channels, stride=1):
@@ -721,6 +726,7 @@ class ResBlock(nn.Module):
         out += identity
         out = self.relu(out)
         return out
+
 
 class ImageEncoder(nn.Module):
     """Much better replacement for your basic CNN encoder"""
@@ -775,33 +781,63 @@ class ImageEncoder(nn.Module):
         x = x.view(x.size(0), -1)  # [B, 512]
         return self.head(x)  # [B, output_dim]
 
+
 def dual_rna_image_encoder_separate(control_images, treatment_images, control_rna, treatment_rna, 
-                                   image_encoder, rna_encoder, device):
+                                   image_encoder, rna_encoder, device, has_rna=True, has_imaging=True):
     """
     Encode paired control and treatment data maintaining separate representations.
+    Now supports single modality training by handling None encoders.
     
     This approach:
-    - Learns gene-to-gene mappings via cross-attention
+    - Learns gene-to-gene mappings via cross-attention (if RNA available)
     - Maintains separate control and treatment feature vectors
-    - Useful when your downstream model expects distinct control/treatment inputs
+    - Handles single modality cases by using zero tensors for missing modalities
+    - Avoids creating dummy encoders for efficiency
+    
+    Args:
+        control_images: Control images tensor
+        treatment_images: Treatment images tensor  
+        control_rna: Control RNA tensor
+        treatment_rna: Treatment RNA tensor
+        image_encoder: Image encoder model (can be None for RNA-only)
+        rna_encoder: RNA encoder model (can be None for image-only) 
+        device: Device to run on
+        has_rna: Whether RNA data is available
+        has_imaging: Whether imaging data is available
     
     Output: Stack of [control_features, treatment_features] where each has been enhanced by cross-attention
     """
-    # Encode images separately
-    control_img_features = image_encoder(control_images.to(device))
-    treatment_img_features = image_encoder(treatment_images.to(device))
     
-    underlying_rna_encoder = rna_encoder.module if hasattr(rna_encoder, 'module') else rna_encoder
-    
-    if hasattr(underlying_rna_encoder, 'apply_cross_attention'):
-        # Use PairedRNAEncoder to get separate cross-attended representations
-        control_rna_features, treatment_rna_features = rna_encoder(
-            control_rna.to(device), treatment_rna.to(device), return_separate=True
-        )
+    # Encode images if available, otherwise use zero tensors
+    if has_imaging and image_encoder is not None:
+        control_img_features = image_encoder(control_images.to(device))
+        treatment_img_features = image_encoder(treatment_images.to(device))
     else:
-        # Fallback to old RNAEncoder (no cross-attention)
-        control_rna_features = rna_encoder(control_rna.to(device))
-        treatment_rna_features = rna_encoder(treatment_rna.to(device))
+        # Create zero tensors with expected image feature dimensions
+        batch_size = control_images.shape[0] if control_images is not None else control_rna.shape[0]
+        img_feature_dim = 128  # Default image feature dimension
+        control_img_features = torch.zeros(batch_size, img_feature_dim, device=device)
+        treatment_img_features = torch.zeros(batch_size, img_feature_dim, device=device)
+    
+    # Encode RNA if available, otherwise use zero tensors  
+    if has_rna and rna_encoder is not None:
+        underlying_rna_encoder = rna_encoder.module if hasattr(rna_encoder, 'module') else rna_encoder
+        
+        if hasattr(underlying_rna_encoder, 'apply_cross_attention'):
+            # Use PairedRNAEncoder to get separate cross-attended representations
+            control_rna_features, treatment_rna_features = rna_encoder(
+                control_rna.to(device), treatment_rna.to(device), return_separate=True
+            )
+        else:
+            # Fallback to old RNAEncoder (no cross-attention)
+            control_rna_features = rna_encoder(control_rna.to(device))
+            treatment_rna_features = rna_encoder(treatment_rna.to(device))
+    else:
+        # Create zero tensors with expected RNA feature dimensions
+        batch_size = control_rna.shape[0] if control_rna is not None else control_images.shape[0]
+        rna_feature_dim = 64  # Default RNA feature dimension (or 128 for paired encoder)
+        control_rna_features = torch.zeros(batch_size, rna_feature_dim, device=device)
+        treatment_rna_features = torch.zeros(batch_size, rna_feature_dim, device=device)
     
     # Concatenate image and RNA features for each condition
     control_features = torch.cat([control_img_features, control_rna_features], dim=-1)
@@ -812,3 +848,4 @@ def dual_rna_image_encoder_separate(control_images, treatment_images, control_rn
     attention_mask = torch.ones(combined_features.size(0), 2, dtype=torch.bool, device=device)
     
     return combined_features, attention_mask
+
